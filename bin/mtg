@@ -166,6 +166,7 @@ CORE_FORMATS = (
     "pauper",
     "commander",
 )
+ARCHIDEKT_PATTERN = re.compile(r"archidekt\.com/(?:api/)?decks/(\d+)")
 FORMAT_ALIASES = {
     "edh": "commander",
     "duelcommander": "duel",
@@ -372,6 +373,10 @@ def spellbook_api():
     return os.environ.get(
         "MTG_SPELLBOOK_API", "https://backend.commanderspellbook.com"
     ).rstrip("/")
+
+
+def archidekt_api():
+    return os.environ.get("MTG_ARCHIDEKT_API", "https://archidekt.com/api").rstrip("/")
 
 
 def utc_now():
@@ -2497,15 +2502,63 @@ def deck_json(result, statistics, signals, combos):
     }
 
 
-def cmd_deck(args):
+def archidekt_list(deck):
+    categories = deck.get("categories") or []
+    premier = {item["name"] for item in categories if item.get("isPremier")}
+    outside = {
+        item["name"] for item in categories if not item.get("includedInDeck", True)
+    }
+    sections = {
+        "Commander": [],
+        "Companion": [],
+        "Deck": [],
+        "Sideboard": [],
+        "Maybeboard": [],
+    }
+    for entry in deck.get("cards") or []:
+        name = ((entry.get("card") or {}).get("oracleCard") or {}).get("name")
+        if not name:
+            continue
+        tags = set(entry.get("categories") or [])
+        if entry.get("companion"):
+            section = "Companion"
+        elif tags & premier or "Commander" in tags:
+            section = "Commander"
+        elif tags & outside or "Maybeboard" in tags:
+            section = "Maybeboard"
+        elif "Sideboard" in tags:
+            section = "Sideboard"
+        else:
+            section = "Deck"
+        sections[section].append(f"{entry.get('quantity') or 1} {name}")
+    lines = []
+    for title, cards in sections.items():
+        if cards:
+            lines += [title, *sorted(cards), ""]
+    return "\n".join(lines)
+
+
+def read_deck_source(source):
+    if source == "-":
+        return sys.stdin.read()
+    match = ARCHIDEKT_PATTERN.search(source)
+    if match:
+        url = f"{archidekt_api()}/decks/{match.group(1)}/"
+        try:
+            return archidekt_list(http_get_json(url))
+        except urllib.error.HTTPError as error:
+            raise MtgError(
+                f"Archidekt answered {error.code} for deck {match.group(1)}. "
+                "Private decks can't be read."
+            ) from None
     try:
-        text = (
-            sys.stdin.read()
-            if args.file == "-"
-            else Path(args.file).expanduser().read_text(encoding="utf-8")
-        )
+        return Path(source).expanduser().read_text(encoding="utf-8")
     except OSError as error:
-        raise MtgError(f"can't read {args.file}: {error.strerror}") from None
+        raise MtgError(f"can't read {source}: {error.strerror}") from None
+
+
+def cmd_deck(args):
+    text = read_deck_source(args.file)
     connection = open_db()
     entries = parse_decklist(text)
     if not entries:
@@ -2693,12 +2746,14 @@ def build_parser():
         "deck",
         help="check a decklist and print its cards",
         description=(
-            "Reads a decklist (Moxfield, Archidekt, MTGA, MTGO or plain text). "
+            "Reads a decklist (Moxfield, Archidekt, MTGA, MTGO or plain text) or a public Archidekt link. "
             "A Commander section or --commander means Commander, unless --format says "
             "otherwise. Exit status 1 when it finds problems."
         ),
     )
-    deck.add_argument("file", help="decklist file, or - for standard input")
+    deck.add_argument(
+        "file", help="decklist file, an Archidekt deck link, or - for standard input"
+    )
     deck.add_argument(
         "--format",
         help="format to check, such as modern, pauper, vintage, brawl or oathbreaker",

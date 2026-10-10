@@ -33,6 +33,7 @@ mtg card "Lightning Bolt" --rulings
 mtg search --legal pauper --colors r --type instant --mv 1 --text damage
 mtg search --ci rw --legal commander --tag removal --sort edhrec
 mtg deck burn.txt --format modern
+mtg deck https://archidekt.com/decks/872380
 mtg deck feather.txt --commander "Feather, the Redeemed" --combos
 mtg sql "SELECT name FROM cards WHERE json_extract(legalities, '$.modern') = 'banned'"
 ```
@@ -45,7 +46,7 @@ mtg sql "SELECT name FROM cards WHERE json_extract(legalities, '$.modern') = 'ba
 
 ## Decks
 
-`mtg deck` reads Moxfield, Archidekt, MTGA, MTGO and plain text lists. `--format` sets the rules:
+`mtg deck` reads Moxfield, Archidekt, MTGA, MTGO and plain text lists, and public Archidekt links. `--format` sets the rules:
 
 - Standard, Pioneer, Modern, Legacy, Vintage, Pauper, Premodern, Old School, Penny Dreadful, Historic, Timeless, Alchemy: 60 cards or more, a sideboard of 15 or fewer, 4 copies across main deck and sideboard, restricted cards, legality.
 - Commander, Duel Commander, PreDH, Pauper Commander, Brawl, Standard Brawl, Oathbreaker: deck size, singleton, color identity, and which cards can be the commander.
@@ -58,13 +59,14 @@ Limits: tutors come from Scryfall Tagger tags, which are community work. For Pau
 
 ## Data
 
-`mtg upgrade` downloads three Scryfall bulk files (every printing, the rulings and the Tagger oracle tags) and the set list, then builds an SQLite database. A failed upgrade keeps the old database. `mtg update` makes 2 small API calls. Only `mtg update`, `mtg upgrade` and `mtg deck --combos` use the network.
+`mtg upgrade` downloads three Scryfall bulk files (every printing, the rulings and the Tagger oracle tags) and the set list, then builds an SQLite database. A failed upgrade keeps the old database. `mtg update` makes 2 small API calls. Only `mtg update`, `mtg upgrade`, `mtg deck --combos` and `mtg deck` with an Archidekt link use the network.
 
 | Variable | Default |
 | --- | --- |
 | `MTG_HOME` | `$XDG_CACHE_HOME/mtg`, or `~/.cache/mtg` |
 | `MTG_SCRYFALL_API` | `https://api.scryfall.com` |
 | `MTG_SPELLBOOK_API` | `https://backend.commanderspellbook.com` |
+| `MTG_ARCHIDEKT_API` | `https://archidekt.com/api` |
 
 ## Tests
 
@@ -72,7 +74,7 @@ Limits: tutors come from Scryfall Tagger tags, which are community work. For Pau
 python3 tests/test_mtg.py
 ```
 
-The tests run `bin/mtg` against a local fake Scryfall and Commander Spellbook, so they need no network. GitHub Actions runs them on Python 3.9 and on the latest Python for each push and pull request. `tests/fixtures/scryfall_cards.jsonl` holds a few real Scryfall card objects to check the data shape.
+The tests run `bin/mtg` against a local fake Scryfall, Commander Spellbook and Archidekt, so they need no network. GitHub Actions runs them on Python 3.9 and on the latest Python for each push and pull request. `tests/fixtures/scryfall_cards.jsonl` holds a few real Scryfall card objects to check the data shape.
 
 ## Uninstall
 

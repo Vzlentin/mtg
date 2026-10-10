@@ -656,6 +656,39 @@ def fixture_sets(version):
     ]
 
 
+def archidekt_card(name, quantity, category):
+    return {
+        "quantity": quantity,
+        "categories": [category],
+        "companion": False,
+        "card": {"oracleCard": {"name": name}},
+    }
+
+
+def archidekt_deck():
+    cards = [
+        archidekt_card("Feather, the Redeemed", 1, "Commander"),
+        archidekt_card("Expedite", 1, "Instant"),
+        archidekt_card("Gamble", 1, "Sorcery"),
+        archidekt_card("Wear // Tear", 1, "Instant"),
+        archidekt_card("Witch Enchanter // Witch-Blessed Meadow", 1, "Creature"),
+        archidekt_card("Gandalf, Goblins' Bane // Flameshape", 1, "Creature"),
+        archidekt_card("Swords to Plowshares", 1, "Instant"),
+        archidekt_card("Arid Mesa", 1, "Land"),
+        archidekt_card("Dáin Ironfoot", 1, "Creature"),
+        archidekt_card("Mountain", 45, "Land"),
+        archidekt_card("Plains", 46, "Land"),
+        archidekt_card("Counterspell", 1, "Maybeboard"),
+    ]
+    categories = [
+        {"name": "Commander", "includedInDeck": True, "isPremier": True},
+        {"name": "Maybeboard", "includedInDeck": False, "isPremier": False},
+    ]
+    for name in ("Instant", "Sorcery", "Creature", "Land"):
+        categories.append({"name": name, "includedInDeck": True, "isPremier": False})
+    return {"name": "Plume", "deckFormat": 3, "categories": categories, "cards": cards}
+
+
 def write_gzip_lines(path, items):
     with gzip.open(path, "wt", encoding="utf-8") as handle:
         for item in items:
@@ -666,6 +699,10 @@ def write_fixtures(root, base_url, version, broken=False, cards=None):
     (root / "api").mkdir(parents=True, exist_ok=True)
     (root / "data").mkdir(parents=True, exist_ok=True)
     (root / "spellbook").mkdir(parents=True, exist_ok=True)
+    (root / "archidekt" / "decks" / "4242").mkdir(parents=True, exist_ok=True)
+    (root / "archidekt" / "decks" / "4242" / "index.html").write_text(
+        json.dumps(archidekt_deck()), encoding="utf-8"
+    )
     if cards is None:
         cards = fixture_cards(version)
     write_gzip_lines(root / "data" / "default_cards.jsonl.gz", cards)
@@ -770,6 +807,7 @@ def mtg_environment(home, base_url):
             "MTG_HOME": str(home),
             "MTG_SCRYFALL_API": f"{base_url}/api",
             "MTG_SPELLBOOK_API": f"{base_url}/spellbook",
+            "MTG_ARCHIDEKT_API": f"{base_url}/archidekt",
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
         }
@@ -1016,6 +1054,18 @@ class CardDatabaseTest(unittest.TestCase):
             self.assertIn(expected, problems)
         self.assertNotIn("Relentless Rats: 3 copies", problems)
         self.assertIn("Not counted: 1 in side", result.stdout)
+
+    def test_deck_reads_an_archidekt_link(self):
+        result = self.mtg("deck", "https://archidekt.com/decks/4242/plume")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "Format: Commander\nCommander: Feather, the Redeemed (WR)", result.stdout
+        )
+        self.assertIn("Cards: 100 (1 commander + 99)", result.stdout)
+        self.assertIn("Not counted: 1 in maybe", result.stdout)
+        private = self.mtg("deck", "https://archidekt.com/decks/9999/private")
+        self.assertEqual(private.returncode, 2)
+        self.assertIn("Archidekt answered 404 for deck 9999", private.stderr)
 
     def test_deck_checks_combos_and_prints_json(self):
         result = self.mtg("deck", "-", "--combos", "--json", stdin=valid_deck())

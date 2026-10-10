@@ -20,3 +20,11 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python tests/test_mtg.py
+
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: pipx run ruff==0.16.9 check bin/mtg tests
+      - run: pipx run ruff==0.16.9 format --check bin/mtg tests
+      - run: shellcheck install.sh

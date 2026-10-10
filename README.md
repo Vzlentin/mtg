@@ -72,7 +72,7 @@ Limits: tutors come from Scryfall Tagger tags, which are community work. For Pau
 python3 tests/test_mtg.py
 ```
 
-The tests run `bin/mtg` against a local fake Scryfall and Commander Spellbook, so they need no network. `tests/fixtures/scryfall_cards.jsonl` holds a few real Scryfall card objects to check the data shape.
+The tests run `bin/mtg` against a local fake Scryfall and Commander Spellbook, so they need no network. GitHub Actions runs them on Python 3.9 and on the latest Python for each push and pull request. `tests/fixtures/scryfall_cards.jsonl` holds a few real Scryfall card objects to check the data shape.
 
 ## Uninstall
 

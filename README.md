@@ -81,4 +81,6 @@ rm ~/.local/bin/mtg
 rm -r ~/.cache/mtg
 ```
 
-Magic: The Gathering and its card text belong to Wizards of the Coast. The card data comes from Scryfall. This project is not affiliated with Wizards of the Coast, Scryfall or Commander Spellbook.
+## License
+
+MIT, see [LICENSE](LICENSE). Magic: The Gathering and its card text belong to Wizards of the Coast. The card data comes from Scryfall. This project is not affiliated with Wizards of the Coast, Scryfall or Commander Spellbook.

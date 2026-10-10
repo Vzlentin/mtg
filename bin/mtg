@@ -1,0 +1,2746 @@
+#!/usr/bin/env python3
+"""Local Magic: The Gathering card database built from Scryfall bulk data.
+
+Data lives in $MTG_HOME, by default $XDG_CACHE_HOME/mtg or ~/.cache/mtg.
+Run `mtg --help` for the commands.
+"""
+
+import argparse
+import datetime
+import difflib
+import functools
+import gzip
+import json
+import operator
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+VERSION = "1.0"
+USER_AGENT = f"mtg-cli/{VERSION} (+https://github.com/Vzlentin/mtg)"
+SCHEMA_VERSION = "2"
+DATASETS = ("default_cards", "rulings", "oracle_tags")
+NON_GAME_LAYOUTS = frozenset(
+    {
+        "art_series",
+        "double_faced_token",
+        "emblem",
+        "front_card",
+        "planar",
+        "scheme",
+        "token",
+        "vanguard",
+    }
+)
+COLOR_ORDER = "WUBRG"
+TYPE_GROUPS = (
+    "Land",
+    "Creature",
+    "Planeswalker",
+    "Battle",
+    "Instant",
+    "Sorcery",
+    "Artifact",
+    "Enchantment",
+)
+DISPLAY_GROUPS = (
+    "Commander",
+    "Creature",
+    "Planeswalker",
+    "Battle",
+    "Instant",
+    "Sorcery",
+    "Artifact",
+    "Enchantment",
+    "Land",
+    "Other",
+    "Sideboard",
+)
+GROUP_TITLES = {
+    "Commander": "Commander",
+    "Sideboard": "Sideboard",
+    "Creature": "Creatures",
+    "Planeswalker": "Planeswalkers",
+    "Battle": "Battles",
+    "Instant": "Instants",
+    "Sorcery": "Sorceries",
+    "Artifact": "Artifacts",
+    "Enchantment": "Enchantments",
+    "Land": "Lands",
+    "Other": "Other",
+}
+SORT_ORDERS = {
+    "edhrec": "c.edhrec_rank IS NULL, c.edhrec_rank {direction}, c.name",
+    "name": "c.name {direction}",
+    "mv": "c.cmc {direction}, c.name",
+    "released": "c.first_released {direction}, c.name",
+    "price": "c.eur IS NULL, c.eur {direction}, c.name",
+}
+SECTION_NAMES = {
+    "commander": "commander",
+    "commanders": "commander",
+    "companion": "companion",
+    "companions": "companion",
+    "deck": "main",
+    "main": "main",
+    "mainboard": "main",
+    "side": "side",
+    "sideboard": "side",
+    "maybe": "maybe",
+    "maybeboard": "maybe",
+    "considering": "maybe",
+    "token": "tokens",
+    "tokens": "tokens",
+}
+PAIRING_TEXT = (
+    "Partner",
+    "Friends forever",
+    "Choose a Background",
+    "Doctor's companion",
+)
+# Deck rules by Scryfall format key. Other formats get the legality check only.
+COMMANDER_FORMATS = {
+    "commander": 100,
+    "duel": 100,
+    "predh": 100,
+    "paupercommander": 100,
+    "brawl": 100,
+    "standardbrawl": 60,
+    "oathbreaker": 60,
+}
+SINGLETON_FORMATS = {"gladiator": 100}
+CONSTRUCTED_FORMATS = frozenset(
+    {
+        "alchemy",
+        "future",
+        "historic",
+        "legacy",
+        "modern",
+        "oldschool",
+        "pauper",
+        "penny",
+        "pioneer",
+        "premodern",
+        "standard",
+        "timeless",
+        "vintage",
+    }
+)
+FORMAT_NAMES = {
+    "alchemy": "Alchemy",
+    "brawl": "Brawl",
+    "commander": "Commander",
+    "competitivebrawl": "Competitive Brawl",
+    "duel": "Duel Commander",
+    "future": "Future Standard",
+    "gladiator": "Gladiator",
+    "historic": "Historic",
+    "legacy": "Legacy",
+    "modern": "Modern",
+    "oathbreaker": "Oathbreaker",
+    "oldschool": "Old School",
+    "pauper": "Pauper",
+    "paupercommander": "Pauper Commander",
+    "penny": "Penny Dreadful",
+    "pioneer": "Pioneer",
+    "predh": "PreDH",
+    "premodern": "Premodern",
+    "standard": "Standard",
+    "standardbrawl": "Standard Brawl",
+    "timeless": "Timeless",
+    "vintage": "Vintage",
+}
+CORE_FORMATS = (
+    "standard",
+    "pioneer",
+    "modern",
+    "legacy",
+    "vintage",
+    "pauper",
+    "commander",
+)
+FORMAT_ALIASES = {
+    "edh": "commander",
+    "duelcommander": "duel",
+    "historicbrawl": "brawl",
+    "pennydreadful": "penny",
+}
+# Future Standard flips for every card of each new set.
+SKIPPED_CHANGE_FORMATS = frozenset({"future"})
+NUMBER_WORDS = {
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+MV_PATTERN = re.compile(r"^\s*(<=|>=|==|<|>|=)?\s*(\d+(?:\.\d+)?)\s*$")
+SECTION_PATTERN = re.compile(
+    r"^(?://\s*)?(commanders?|companions?|deck|main|mainboard|sideboard|side|maybeboard|maybe|considering|tokens?)"
+    r"\s*:?\s*(?:\(\d+\))?$",
+    re.IGNORECASE,
+)
+QUANTITY_PATTERN = re.compile(r"^(\d+)\s*[xX]?\s+(.+)$")
+CATEGORY_PATTERN = re.compile(r"\[([^\]]*)\]")
+MARKER_PATTERN = re.compile(r"\*(?:F|E|A|CMDR)\*", re.IGNORECASE)
+COLOR_TAG_PATTERN = re.compile(r"\^[^^]*\^")
+HASHTAG_PATTERN = re.compile(r"(?:^|\s)#\S+")
+SET_PATTERN = re.compile(r"\s+\(([A-Za-z0-9]{2,8})\)(?:\s+\S+)?\s*$")
+ANY_NUMBER_PATTERN = re.compile(r"A deck can have any number of cards named")
+UP_TO_PATTERN = re.compile(r"A deck can have up to (\w+) cards named")
+
+SCHEMA = """
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE cards (
+    oracle_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    layout TEXT,
+    mana_cost TEXT,
+    cmc REAL,
+    type_line TEXT,
+    oracle_text TEXT,
+    power TEXT,
+    toughness TEXT,
+    loyalty TEXT,
+    defense TEXT,
+    colors TEXT,
+    color_identity TEXT,
+    keywords TEXT,
+    legalities TEXT,
+    game_changer INTEGER,
+    reserved INTEGER,
+    edhrec_rank INTEGER,
+    game_card INTEGER,
+    paper INTEGER,
+    first_released TEXT,
+    first_set TEXT,
+    last_released TEXT,
+    eur REAL,
+    usd REAL
+);
+CREATE TABLE faces (
+    oracle_id TEXT,
+    idx INTEGER,
+    name TEXT,
+    mana_cost TEXT,
+    type_line TEXT,
+    oracle_text TEXT,
+    power TEXT,
+    toughness TEXT,
+    loyalty TEXT,
+    defense TEXT,
+    PRIMARY KEY (oracle_id, idx)
+);
+CREATE TABLE names (key TEXT, oracle_id TEXT, kind INTEGER, PRIMARY KEY (key, oracle_id, kind));
+CREATE TABLE printings (
+    id TEXT PRIMARY KEY,
+    oracle_id TEXT,
+    set_code TEXT,
+    collector_number TEXT,
+    released_at TEXT,
+    rarity TEXT,
+    lang TEXT,
+    digital INTEGER,
+    promo INTEGER,
+    eur REAL,
+    eur_foil REAL,
+    usd REAL,
+    usd_foil REAL
+);
+CREATE TABLE sets (
+    code TEXT PRIMARY KEY,
+    name TEXT,
+    set_type TEXT,
+    released_at TEXT,
+    card_count INTEGER,
+    digital INTEGER,
+    parent_set_code TEXT
+);
+CREATE TABLE rulings (oracle_id TEXT, source TEXT, published_at TEXT, comment TEXT);
+CREATE TABLE tags (slug TEXT PRIMARY KEY, label TEXT, description TEXT);
+CREATE TABLE tag_parents (slug TEXT, parent_slug TEXT, PRIMARY KEY (slug, parent_slug));
+CREATE TABLE card_tags (slug TEXT, oracle_id TEXT, PRIMARY KEY (slug, oracle_id)) WITHOUT ROWID;
+CREATE TABLE changes (kind TEXT, oracle_id TEXT, name TEXT, detail TEXT);
+"""
+
+INDEXES = """
+CREATE INDEX cards_name ON cards (name);
+CREATE INDEX names_oracle ON names (oracle_id);
+CREATE INDEX printings_oracle ON printings (oracle_id);
+CREATE INDEX printings_set ON printings (set_code);
+CREATE INDEX rulings_oracle ON rulings (oracle_id);
+CREATE INDEX card_tags_oracle ON card_tags (oracle_id);
+"""
+
+CARD_COLUMNS = (
+    "oracle_id",
+    "name",
+    "layout",
+    "mana_cost",
+    "cmc",
+    "type_line",
+    "oracle_text",
+    "power",
+    "toughness",
+    "loyalty",
+    "defense",
+    "colors",
+    "color_identity",
+    "keywords",
+    "legalities",
+    "game_changer",
+    "reserved",
+    "edhrec_rank",
+    "game_card",
+    "paper",
+    "first_released",
+    "first_set",
+    "last_released",
+    "eur",
+    "usd",
+)
+FACE_FIELDS = (
+    "name",
+    "mana_cost",
+    "type_line",
+    "oracle_text",
+    "power",
+    "toughness",
+    "loyalty",
+    "defense",
+)
+SNAPSHOT_SQL = (
+    "SELECT oracle_id, name, oracle_text, type_line, mana_cost, legalities, game_changer, game_card, "
+    "first_released, first_set FROM cards"
+)
+# Tagger files a land search under both tutor-land and tutor-to (where the card goes),
+# so a tutor counts only when it has a tutor tag outside those two subtrees.
+TUTOR_SQL = """
+WITH RECURSIVE
+excluded(slug) AS (
+    VALUES ('tutor'), ('tutor-land'), ('tutor-to')
+    UNION
+    SELECT tp.slug FROM tag_parents tp JOIN excluded e ON tp.parent_slug = e.slug WHERE e.slug != 'tutor'
+),
+kinds(slug) AS (
+    SELECT slug FROM tag_parents WHERE parent_slug = 'tutor'
+    UNION
+    SELECT tp.slug FROM tag_parents tp JOIN kinds k ON tp.parent_slug = k.slug
+)
+SELECT DISTINCT oracle_id FROM card_tags
+WHERE slug IN (SELECT slug FROM kinds EXCEPT SELECT slug FROM excluded)
+"""
+
+
+class MtgError(Exception):
+    """An error the user can fix. Printed without a traceback."""
+
+
+def data_dir():
+    explicit = os.environ.get("MTG_HOME")
+    if explicit:
+        return Path(explicit).expanduser()
+    cache_home = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(cache_home).expanduser() / "mtg"
+
+
+def db_path():
+    return data_dir() / "cards.sqlite"
+
+
+def index_path():
+    return data_dir() / "index.json"
+
+
+def scryfall_api():
+    return os.environ.get("MTG_SCRYFALL_API", "https://api.scryfall.com").rstrip("/")
+
+
+def spellbook_api():
+    return os.environ.get(
+        "MTG_SPELLBOOK_API", "https://backend.commanderspellbook.com"
+    ).rstrip("/")
+
+
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def today():
+    return datetime.datetime.now(datetime.timezone.utc).astimezone().date().isoformat()
+
+
+def short_time(stamp):
+    if not stamp:
+        return "unknown"
+    return f"{stamp[:10]} {stamp[11:16]} UTC"
+
+
+def format_mb(size):
+    return f"{size / 1_000_000:.0f} MB"
+
+
+def format_number(value):
+    if value is None:
+        return "?"
+    return f"{value:g}"
+
+
+def to_float(value):
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def color_string(colors):
+    present = set(colors or [])
+    return "".join(color for color in COLOR_ORDER if color in present)
+
+
+def name_key(text):
+    folded = unicodedata.normalize("NFKD", text or "")
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    folded = (
+        folded.replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+    )
+    folded = folded.replace("\u2013", "-").replace("\u2014", "-")
+    folded = re.sub(r"\s+", " ", folded).strip().lower()
+    return folded.replace("\u00e6", "ae")
+
+
+def like_pattern(text):
+    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def placeholders(count):
+    return ", ".join("?" for _ in range(count))
+
+
+def write_json_atomic(path, value):
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, indent=1), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def http_get_json(url):
+    request = urllib.request.Request(
+        url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.load(response)
+
+
+def http_post_json(url, payload):
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        return json.load(response)
+
+
+def download(url, destination, label):
+    request = urllib.request.Request(
+        url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"}
+    )
+    show = sys.stderr.isatty()
+    done = 0
+    with (
+        urllib.request.urlopen(request, timeout=300) as response,
+        open(destination, "wb") as handle,
+    ):
+        total = int(response.headers.get("Content-Length") or 0)
+        while True:
+            chunk = response.read(1 << 20)
+            if not chunk:
+                break
+            handle.write(chunk)
+            done += len(chunk)
+            if show:
+                size = format_mb(done) + (f" of {format_mb(total)}" if total else "")
+                print(f"\r  {label}: {size}  ", end="", file=sys.stderr, flush=True)
+    if show:
+        print(file=sys.stderr)
+    return done
+
+
+def read_json_lines(path):
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                yield json.loads(line)
+
+
+def compact_set(item):
+    return {
+        "code": item.get("code"),
+        "name": item.get("name"),
+        "set_type": item.get("set_type"),
+        "released_at": item.get("released_at"),
+        "card_count": item.get("card_count") or 0,
+        "digital": 1 if item.get("digital") else 0,
+        "parent_set_code": item.get("parent_set_code"),
+    }
+
+
+def fetch_index():
+    bulk = http_get_json(scryfall_api() + "/bulk-data")
+    datasets = {}
+    for item in bulk.get("data", []):
+        if item.get("type") in DATASETS:
+            datasets[item["type"]] = {
+                "updated_at": item.get("updated_at"),
+                "url": item.get("jsonl_download_uri"),
+                "size": item.get("compressed_size") or 0,
+            }
+    missing = [name for name in DATASETS if not datasets.get(name, {}).get("url")]
+    if missing:
+        raise MtgError("Scryfall bulk data has no download for: " + ", ".join(missing))
+    sets = [
+        compact_set(item)
+        for item in http_get_json(scryfall_api() + "/sets").get("data", [])
+    ]
+    index = {"fetched_at": utc_now(), "datasets": datasets, "sets": sets}
+    data_dir().mkdir(parents=True, exist_ok=True)
+    write_json_atomic(index_path(), index)
+    return index
+
+
+def load_index():
+    path = index_path()
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return None
+
+
+def read_meta(path):
+    if not path.exists():
+        return {}
+    try:
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+        try:
+            return dict(connection.execute("SELECT key, value FROM meta").fetchall())
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return {}
+
+
+def datasets_newer(index, meta):
+    if meta.get("schema_version") != SCHEMA_VERSION:
+        return list(DATASETS)
+    newer = []
+    for name in DATASETS:
+        remote = index["datasets"][name]["updated_at"] or ""
+        if remote > (meta.get(f"{name}_updated_at") or ""):
+            newer.append(name)
+    return newer
+
+
+def card_oracle_id(card):
+    if card.get("oracle_id"):
+        return card["oracle_id"]
+    for face in card.get("card_faces") or []:
+        if face.get("oracle_id"):
+            return face["oracle_id"]
+    return None
+
+
+def face_record(face):
+    record = {field: face.get(field) for field in FACE_FIELDS}
+    for field in ("name", "mana_cost", "type_line", "oracle_text"):
+        record[field] = record[field] or ""
+    return record
+
+
+def oracle_record(card):
+    raw_faces = card.get("card_faces") or []
+    first = raw_faces[0] if raw_faces else {}
+    faces = [face_record(face) for face in raw_faces]
+    name = card.get("name") or ""
+    if (
+        card.get("layout") == "reversible_card"
+        and faces
+        and all(face == faces[0] for face in faces)
+    ):
+        # Both sides of a reversible card are the same card.
+        name = faces[0]["name"]
+        faces = []
+    colors = card.get("colors")
+    if colors is None:
+        colors = [color for face in raw_faces for color in face.get("colors") or []]
+    if faces:
+        oracle_text = "\n//\n".join(face["oracle_text"] for face in faces)
+        type_line = card.get("type_line") or " // ".join(
+            face["type_line"] for face in faces
+        )
+    else:
+        oracle_text = card.get("oracle_text") or first.get("oracle_text") or ""
+        type_line = card.get("type_line") or first.get("type_line") or ""
+    mana_cost = card.get("mana_cost")
+    if mana_cost is None:
+        mana_cost = first.get("mana_cost") or ""
+    cmc = card.get("cmc")
+    if cmc is None:
+        cmc = first.get("cmc") or 0
+    legalities = card.get("legalities") or {}
+    layout = card.get("layout")
+    return {
+        "name": name,
+        "layout": layout,
+        "mana_cost": mana_cost,
+        "cmc": cmc,
+        "type_line": type_line,
+        "oracle_text": oracle_text,
+        "power": card.get("power", first.get("power")),
+        "toughness": card.get("toughness", first.get("toughness")),
+        "loyalty": card.get("loyalty", first.get("loyalty")),
+        "defense": card.get("defense", first.get("defense")),
+        "colors": color_string(colors),
+        "color_identity": color_string(card.get("color_identity")),
+        "keywords": json.dumps(card.get("keywords") or []),
+        "legalities": json.dumps(legalities, sort_keys=True),
+        "game_changer": 1 if card.get("game_changer") else 0,
+        "reserved": 1 if card.get("reserved") else 0,
+        "edhrec_rank": card.get("edhrec_rank"),
+        "game_card": 0 if layout in NON_GAME_LAYOUTS else 1,
+        "faces": faces,
+    }
+
+
+def representative_score(card):
+    # Oracle fields are shared by all printings, but reversible printings carry a doubled name.
+    return (
+        card.get("layout") != "reversible_card",
+        not card.get("digital"),
+        card.get("lang") == "en",
+    )
+
+
+def new_stats():
+    return {
+        "first_rank": None,
+        "first_released": None,
+        "first_set": None,
+        "last_released": None,
+        "paper": 0,
+        "eur": None,
+        "eur_foil": None,
+        "usd": None,
+        "usd_foil": None,
+    }
+
+
+def update_stats(stats, card):
+    paper = not card.get("digital")
+    released = card.get("released_at")
+    # Paper printings first, then the earliest date, then a set before its promo set.
+    rank = (
+        0 if paper else 1,
+        released or "9999-12-31",
+        1 if card.get("set_type") == "promo" else 0,
+    )
+    if stats["first_rank"] is None or rank < stats["first_rank"]:
+        stats["first_rank"] = rank
+        stats["first_released"] = released
+        stats["first_set"] = card.get("set")
+    if released and released > (stats["last_released"] or ""):
+        stats["last_released"] = released
+    if not paper:
+        return
+    stats["paper"] = 1
+    prices = card.get("prices") or {}
+    for key in ("eur", "eur_foil", "usd", "usd_foil"):
+        value = to_float(prices.get(key))
+        if value is not None and (stats[key] is None or value < stats[key]):
+            stats[key] = value
+
+
+def printing_row(card, oracle_id):
+    prices = card.get("prices") or {}
+    return (
+        card.get("id"),
+        oracle_id,
+        card.get("set"),
+        card.get("collector_number"),
+        card.get("released_at"),
+        card.get("rarity"),
+        card.get("lang"),
+        1 if card.get("digital") else 0,
+        1 if card.get("promo") else 0,
+        to_float(prices.get("eur")),
+        to_float(prices.get("eur_foil")),
+        to_float(prices.get("usd")),
+        to_float(prices.get("usd_foil")),
+    )
+
+
+def load_cards(connection, path):
+    records = {}
+    scores = {}
+    stats = {}
+    batch = []
+    insert_printing = f"INSERT OR REPLACE INTO printings VALUES ({placeholders(13)})"
+    for card in read_json_lines(path):
+        oracle_id = card_oracle_id(card)
+        if not oracle_id:
+            continue
+        score = representative_score(card)
+        if oracle_id not in records or score > scores[oracle_id]:
+            records[oracle_id] = oracle_record(card)
+            scores[oracle_id] = score
+        update_stats(stats.setdefault(oracle_id, new_stats()), card)
+        batch.append(printing_row(card, oracle_id))
+        if len(batch) >= 5000:
+            connection.executemany(insert_printing, batch)
+            batch.clear()
+    connection.executemany(insert_printing, batch)
+
+    card_rows = []
+    face_rows = []
+    name_rows = set()
+    for oracle_id, record in records.items():
+        card_stats = stats[oracle_id]
+        values = dict(record)
+        values["oracle_id"] = oracle_id
+        values["paper"] = card_stats["paper"]
+        values["first_released"] = card_stats["first_released"]
+        values["first_set"] = card_stats["first_set"]
+        values["last_released"] = card_stats["last_released"]
+        values["eur"] = (
+            card_stats["eur"]
+            if card_stats["eur"] is not None
+            else card_stats["eur_foil"]
+        )
+        values["usd"] = (
+            card_stats["usd"]
+            if card_stats["usd"] is not None
+            else card_stats["usd_foil"]
+        )
+        card_rows.append(tuple(values[column] for column in CARD_COLUMNS))
+        name_rows.add((name_key(record["name"]), oracle_id, 0))
+        for index, face in enumerate(record["faces"]):
+            face_rows.append(
+                (oracle_id, index) + tuple(face[field] for field in FACE_FIELDS)
+            )
+            name_rows.add((name_key(face["name"]), oracle_id, 1))
+    connection.executemany(
+        f"INSERT INTO cards VALUES ({placeholders(len(CARD_COLUMNS))})", card_rows
+    )
+    connection.executemany(
+        f"INSERT INTO faces VALUES ({placeholders(2 + len(FACE_FIELDS))})", face_rows
+    )
+    connection.executemany(
+        "INSERT OR IGNORE INTO names VALUES (?, ?, ?)", sorted(name_rows)
+    )
+    return len(card_rows)
+
+
+def load_rulings(connection, path):
+    batch = []
+    for ruling in read_json_lines(path):
+        batch.append(
+            (
+                ruling.get("oracle_id"),
+                ruling.get("source"),
+                ruling.get("published_at"),
+                ruling.get("comment"),
+            )
+        )
+        if len(batch) >= 10000:
+            connection.executemany("INSERT INTO rulings VALUES (?, ?, ?, ?)", batch)
+            batch.clear()
+    connection.executemany("INSERT INTO rulings VALUES (?, ?, ?, ?)", batch)
+
+
+def tag_descendants(tag_id, tags_by_id, cache):
+    if tag_id in cache:
+        return cache[tag_id]
+    found = {tag_id}
+    pending = list(tags_by_id[tag_id].get("child_ids") or [])
+    while pending:
+        child = pending.pop()
+        if child in found or child not in tags_by_id:
+            continue
+        found.add(child)
+        pending.extend(tags_by_id[child].get("child_ids") or [])
+    cache[tag_id] = found
+    return found
+
+
+def load_tags(connection, path):
+    tags_by_id = {}
+    for tag in read_json_lines(path):
+        if tag.get("slug") and tag.get("type", "oracle") == "oracle":
+            tags_by_id[tag["id"]] = tag
+    connection.executemany(
+        "INSERT OR REPLACE INTO tags VALUES (?, ?, ?)",
+        [
+            (tag["slug"], tag.get("label") or tag["slug"], tag.get("description"))
+            for tag in tags_by_id.values()
+        ],
+    )
+    parent_rows = []
+    for tag in tags_by_id.values():
+        for parent_id in tag.get("parent_ids") or []:
+            if parent_id in tags_by_id:
+                parent_rows.append((tag["slug"], tags_by_id[parent_id]["slug"]))
+    connection.executemany(
+        "INSERT OR IGNORE INTO tag_parents VALUES (?, ?)", parent_rows
+    )
+    # A card tagged with a child tag also matches its parent tags, as on Scryfall.
+    cache = {}
+    batch = []
+    for tag in tags_by_id.values():
+        oracle_ids = set()
+        for tag_id in tag_descendants(tag["id"], tags_by_id, cache):
+            for tagging in tags_by_id[tag_id].get("taggings") or []:
+                if tagging.get("oracle_id"):
+                    oracle_ids.add(tagging["oracle_id"])
+        batch.extend((tag["slug"], oracle_id) for oracle_id in oracle_ids)
+        if len(batch) >= 50000:
+            connection.executemany(
+                "INSERT OR IGNORE INTO card_tags VALUES (?, ?)", batch
+            )
+            batch.clear()
+    connection.executemany("INSERT OR IGNORE INTO card_tags VALUES (?, ?)", batch)
+
+
+def load_sets(connection, sets):
+    rows = [
+        (
+            item["code"],
+            item["name"],
+            item["set_type"],
+            item["released_at"],
+            item["card_count"],
+            item["digital"],
+            item["parent_set_code"],
+        )
+        for item in sets
+        if item.get("code")
+    ]
+    connection.executemany(
+        "INSERT OR REPLACE INTO sets VALUES (?, ?, ?, ?, ?, ?, ?)", rows
+    )
+
+
+def build_search_index(connection):
+    try:
+        connection.execute(
+            "CREATE VIRTUAL TABLE cards_fts USING fts5"
+            "(name, type_line, oracle_text, content='cards', content_rowid='rowid')"
+        )
+        connection.execute("INSERT INTO cards_fts (cards_fts) VALUES ('rebuild')")
+        return True
+    except sqlite3.OperationalError:
+        return False
+
+
+def build_database(files, index, destination):
+    if destination.exists():
+        destination.unlink()
+    connection = sqlite3.connect(destination)
+    try:
+        connection.execute("PRAGMA journal_mode = OFF")
+        connection.execute("PRAGMA synchronous = OFF")
+        connection.executescript(SCHEMA)
+        card_count = load_cards(connection, files["default_cards"])
+        load_rulings(connection, files["rulings"])
+        load_tags(connection, files["oracle_tags"])
+        load_sets(connection, index["sets"])
+        connection.executescript(INDEXES)
+        fts = build_search_index(connection)
+        meta = {
+            "schema_version": SCHEMA_VERSION,
+            "built_at": utc_now(),
+            "index_fetched_at": index["fetched_at"],
+            "fts": "1" if fts else "0",
+        }
+        for name in DATASETS:
+            meta[f"{name}_updated_at"] = index["datasets"][name]["updated_at"]
+        connection.executemany("INSERT INTO meta VALUES (?, ?)", sorted(meta.items()))
+        connection.commit()
+    finally:
+        connection.close()
+    return card_count
+
+
+def read_snapshot(path):
+    try:
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            return {
+                row["oracle_id"]: dict(row) for row in connection.execute(SNAPSHOT_SQL)
+            }
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return None
+
+
+def legality_changes(before_json, after_json):
+    before = json.loads(before_json or "{}")
+    after = json.loads(after_json or "{}")
+    return {
+        fmt: [before.get(fmt), after.get(fmt)]
+        for fmt in sorted(set(before) | set(after))
+        if fmt not in SKIPPED_CHANGE_FORMATS and before.get(fmt) != after.get(fmt)
+    }
+
+
+def compute_changes(old, new):
+    changes = []
+    for oracle_id, row in new.items():
+        before = old.get(oracle_id)
+        if before is None:
+            if row["game_card"]:
+                detail = {"set": row["first_set"], "released": row["first_released"]}
+                changes.append(("new", oracle_id, row["name"], json.dumps(detail)))
+            continue
+        fields = ("oracle_text", "type_line", "mana_cost")
+        if any(before[field] != row[field] for field in fields):
+            detail = {
+                "before": {field: before[field] for field in fields},
+                "after": {field: row[field] for field in fields},
+            }
+            changes.append(("text", oracle_id, row["name"], json.dumps(detail)))
+        formats = legality_changes(before["legalities"], row["legalities"])
+        if formats:
+            detail = {"formats": formats}
+            changes.append(("legality", oracle_id, row["name"], json.dumps(detail)))
+        if bool(before["game_changer"]) != bool(row["game_changer"]):
+            changes.append(
+                (
+                    "game_changer",
+                    oracle_id,
+                    row["name"],
+                    json.dumps({"after": bool(row["game_changer"])}),
+                )
+            )
+    for oracle_id, row in old.items():
+        if oracle_id not in new and row["game_card"]:
+            changes.append(("removed", oracle_id, row["name"], "{}"))
+    return changes
+
+
+def store_changes(path, changes, changes_from, changes_to):
+    connection = sqlite3.connect(path)
+    try:
+        connection.executemany("INSERT INTO changes VALUES (?, ?, ?, ?)", changes)
+        connection.executemany(
+            "INSERT OR REPLACE INTO meta VALUES (?, ?)",
+            [("changes_from", changes_from or ""), ("changes_to", changes_to or "")],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+@functools.lru_cache(maxsize=64)
+def compiled_pattern(pattern):
+    return re.compile(pattern, re.IGNORECASE)
+
+
+def sql_regexp(pattern, value):
+    if value is None:
+        return 0
+    return 1 if compiled_pattern(pattern).search(value) else 0
+
+
+def open_db():
+    path = db_path()
+    if not path.exists():
+        raise MtgError("no local card data. Run `mtg upgrade` first.")
+    connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    connection.create_function("regexp", 2, sql_regexp, deterministic=True)
+    version = connection.execute(
+        "SELECT value FROM meta WHERE key = 'schema_version'"
+    ).fetchone()
+    if not version or version[0] != SCHEMA_VERSION:
+        connection.close()
+        raise MtgError(
+            "the local database comes from another mtg version. Run `mtg upgrade`."
+        )
+    return connection
+
+
+def lookup_key(connection, key):
+    return connection.execute(
+        "SELECT c.oracle_id, c.name FROM names n JOIN cards c ON c.oracle_id = n.oracle_id WHERE n.key = ? "
+        "ORDER BY c.game_card DESC, c.paper DESC, n.kind, c.edhrec_rank IS NULL, c.edhrec_rank LIMIT 1",
+        (key,),
+    ).fetchone()
+
+
+def resolve_name(connection, raw):
+    key = name_key(raw)
+    found = lookup_key(connection, key)
+    if found is None and "//" in key:
+        found = lookup_key(connection, key.split("//")[0].strip())
+    return found
+
+
+def name_index(connection):
+    rows = connection.execute(
+        "SELECT n.key, c.name FROM names n JOIN cards c ON c.oracle_id = n.oracle_id "
+        "WHERE c.game_card = 1 ORDER BY n.kind"
+    ).fetchall()
+    index = {}
+    for key, name in rows:
+        index.setdefault(key, name)
+    return index
+
+
+def suggestions(raw, index):
+    matches = difflib.get_close_matches(name_key(raw), list(index), n=5, cutoff=0.75)
+    names = []
+    for match in matches:
+        if index[match] not in names:
+            names.append(index[match])
+    return names[:3]
+
+
+def missing_card_message(raw, index):
+    hint = suggestions(raw, index)
+    message = f"no card named {raw!r}"
+    if hint:
+        message += ". Did you mean " + " or ".join(hint) + "?"
+    return message
+
+
+def card_payload(connection, oracle_id, rulings=False, prints=False):
+    card = connection.execute(
+        "SELECT * FROM cards WHERE oracle_id = ?", (oracle_id,)
+    ).fetchone()
+    faces = [
+        dict(row)
+        for row in connection.execute(
+            f"SELECT {', '.join(FACE_FIELDS)} FROM faces WHERE oracle_id = ? ORDER BY idx",
+            (oracle_id,),
+        )
+    ]
+    payload = {field: card[field] for field in FACE_FIELDS}
+    payload.update(
+        {
+            "oracle_id": oracle_id,
+            "layout": card["layout"],
+            "mv": card["cmc"],
+            "colors": card["colors"],
+            "color_identity": card["color_identity"],
+            "keywords": json.loads(card["keywords"] or "[]"),
+            "legalities": json.loads(card["legalities"] or "{}"),
+            "game_changer": bool(card["game_changer"]),
+            "edhrec_rank": card["edhrec_rank"],
+            "first_released": card["first_released"],
+            "first_set": card["first_set"],
+            "eur": card["eur"],
+            "usd": card["usd"],
+            "faces": faces,
+            "scryfall": "https://scryfall.com/search?q="
+            + urllib.parse.quote(f"oracleid:{oracle_id}"),
+        }
+    )
+    if rulings:
+        payload["rulings"] = [
+            {
+                "date": row["published_at"],
+                "source": row["source"],
+                "text": row["comment"],
+            }
+            for row in connection.execute(
+                "SELECT published_at, source, comment FROM rulings WHERE oracle_id = ? ORDER BY published_at",
+                (oracle_id,),
+            )
+        ]
+    if prints:
+        payload["printings"] = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT set_code, collector_number, released_at, rarity, digital, eur, usd FROM printings "
+                "WHERE oracle_id = ? ORDER BY digital, released_at, set_code",
+                (oracle_id,),
+            )
+        ]
+    return payload
+
+
+def face_stats(face):
+    if face.get("power") is not None and face.get("toughness") is not None:
+        return f"{face['power']}/{face['toughness']}"
+    if face.get("loyalty") is not None:
+        return f"loyalty {face['loyalty']}"
+    if face.get("defense") is not None:
+        return f"defense {face['defense']}"
+    return ""
+
+
+def price_text(eur, usd):
+    parts = []
+    if eur is not None:
+        parts.append(f"\u20ac{eur:.2f}")
+    if usd is not None:
+        parts.append(f"${usd:.2f}")
+    return " / ".join(parts)
+
+
+def legality_summary(legalities):
+    legal = [fmt for fmt in CORE_FORMATS if legalities.get(fmt) == "legal"]
+    parts = [
+        "legal in " + ", ".join(legal) if legal else "not legal in the main formats"
+    ]
+    for state in ("banned", "restricted"):
+        formats = [fmt for fmt in CORE_FORMATS if legalities.get(fmt) == state]
+        if formats:
+            parts.append(f"{state} in " + ", ".join(formats))
+    return parts
+
+
+def meta_parts(payload):
+    parts = [
+        f"MV {format_number(payload['mv'])}",
+        f"identity {payload['color_identity'] or 'C'}",
+        *legality_summary(payload["legalities"]),
+    ]
+    if payload["game_changer"]:
+        parts.append("Game Changer")
+    if payload["first_released"]:
+        first = f"first printed {payload['first_released']} ({payload['first_set']})"
+        if payload["first_released"] > today():
+            first += ", not released yet"
+        parts.append(first)
+    price = price_text(payload["eur"], payload["usd"])
+    if price:
+        parts.append("from " + price)
+    if payload["edhrec_rank"]:
+        parts.append(f"EDHREC #{payload['edhrec_rank']}")
+    return parts
+
+
+def card_faces_or_self(payload):
+    if payload["faces"]:
+        return payload["faces"]
+    return [{field: payload[field] for field in FACE_FIELDS}]
+
+
+def extra_lines(payload):
+    lines = []
+    if payload.get("rulings"):
+        lines.append("Rulings:")
+        lines.extend(
+            f"- {ruling['date']}: {ruling['text']}" for ruling in payload["rulings"]
+        )
+    if payload.get("printings"):
+        lines.append("Printings:")
+        for printing in payload["printings"]:
+            parts = [
+                printing["set_code"],
+                printing["collector_number"] or "",
+                printing["released_at"] or "",
+            ]
+            parts.append(printing["rarity"] or "")
+            if printing["digital"]:
+                parts.append("digital")
+            price = price_text(printing["eur"], printing["usd"])
+            if price:
+                parts.append(price)
+            lines.append("- " + " ".join(part for part in parts if part))
+    return lines
+
+
+def card_text(payload, quantity=1):
+    lines = []
+    if payload["faces"]:
+        lines.append(
+            f"{quantity}x {payload['name']}" if quantity > 1 else payload["name"]
+        )
+    for index, face in enumerate(card_faces_or_self(payload)):
+        if index:
+            lines.append("//")
+        head = " ".join(part for part in (face["name"], face["mana_cost"]) if part)
+        if quantity > 1 and not payload["faces"]:
+            head = f"{quantity}x {head}"
+        lines.append(head)
+        lines.append(
+            " ".join(part for part in (face["type_line"], face_stats(face)) if part)
+        )
+        if face["oracle_text"]:
+            lines.extend(face["oracle_text"].split("\n"))
+    lines.append("[" + ", ".join(meta_parts(payload)) + "]")
+    lines.extend(extra_lines(payload))
+    return "\n".join(lines)
+
+
+def card_markdown(payload, quantity=1):
+    title = f"{quantity}x {payload['name']}" if quantity > 1 else payload["name"]
+    lines = [f"### {title}", ""]
+    for face in card_faces_or_self(payload):
+        head = f"**{face['name']}**"
+        if face["mana_cost"]:
+            head += f" `{face['mana_cost']}`"
+        head += f" | {face['type_line']}"
+        stats = face_stats(face)
+        if stats:
+            head += f" ({stats})"
+        lines.append(head)
+        text = face["oracle_text"] or "(no rules text)"
+        lines.extend("> " + line if line else ">" for line in text.split("\n"))
+        lines.append("")
+    lines.append("_" + " \u00b7 ".join(meta_parts(payload)) + "_")
+    extras = extra_lines(payload)
+    if extras:
+        lines.append("")
+        lines.extend(extras)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def print_json(value):
+    print(json.dumps(value, indent=2, ensure_ascii=False))
+
+
+def update_report(index, meta, local_sets):
+    remote_date = index["datasets"]["default_cards"]["updated_at"]
+    newer = datasets_newer(index, meta) if meta else list(DATASETS)
+    new_sets = []
+    grown_sets = []
+    if local_sets is not None:
+        for item in index["sets"]:
+            if item["digital"] or not item["card_count"]:
+                continue
+            before = local_sets.get(item["code"])
+            if before is None:
+                new_sets.append(item)
+            elif item["card_count"] > before:
+                grown = dict(item)
+                grown["added"] = item["card_count"] - before
+                grown_sets.append(grown)
+    released = operator.itemgetter("released_at")
+    return {
+        "local_data": meta.get("default_cards_updated_at"),
+        "remote_data": remote_date,
+        "newer_datasets": newer,
+        "upgrade_available": bool(newer),
+        "rebuild_needed": bool(meta) and meta.get("schema_version") != SCHEMA_VERSION,
+        "download_size": sum(index["datasets"][name]["size"] for name in DATASETS),
+        "new_sets": sorted(new_sets, key=released, reverse=True),
+        "grown_sets": sorted(grown_sets, key=released, reverse=True),
+    }
+
+
+def print_update_report(report, has_data):
+    if not has_data:
+        print(
+            f"No local card data. Run `mtg upgrade` to download about {format_mb(report['download_size'])}."
+        )
+        return
+    print(f"Local data: {short_time(report['local_data'])}")
+    print(f"Scryfall:   {short_time(report['remote_data'])}")
+    if not report["upgrade_available"]:
+        print("Up to date.")
+        return
+    if report["rebuild_needed"]:
+        print(
+            "The local database comes from an older mtg version. Run `mtg upgrade` to "
+            f"rebuild it (about {format_mb(report['download_size'])})."
+        )
+        return
+    lines = []
+    for item in report["new_sets"]:
+        lines.append(
+            f"  {item['code']:<6} {item['name'][:40]:<40} new set, {item['card_count']} cards, "
+            f"release {item['released_at']}"
+        )
+    for item in report["grown_sets"]:
+        lines.append(
+            f"  {item['code']:<6} {item['name'][:40]:<40} +{item['added']} cards, release {item['released_at']}"
+        )
+    if lines:
+        print("New cards on Scryfall:")
+        for line in lines[:20]:
+            print(line)
+        if len(lines) > 20:
+            print(f"  and {len(lines) - 20} more sets")
+    else:
+        print("Scryfall has newer data (prices and fixes). No new cards.")
+    print(f"Run `mtg upgrade` to download about {format_mb(report['download_size'])}.")
+
+
+def local_set_counts(path):
+    if not path.exists():
+        return None
+    try:
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+        try:
+            return dict(
+                connection.execute("SELECT code, card_count FROM sets").fetchall()
+            )
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return None
+
+
+def cmd_update(args):
+    index = fetch_index()
+    path = db_path()
+    meta = read_meta(path)
+    report = update_report(index, meta, local_set_counts(path))
+    if args.json:
+        report["has_data"] = bool(meta)
+        print_json(report)
+    else:
+        print_update_report(report, bool(meta))
+    return 0
+
+
+def count_key(item):
+    return (-item[1], item[0])
+
+
+def count_text(counts, limit=8):
+    items = sorted(counts.items(), key=count_key)
+    return ", ".join(f"{name} {count}" for name, count in items[:limit])
+
+
+def print_upgrade_summary(path, changes, changes_from):
+    meta = read_meta(path)
+    connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+    try:
+        cards = connection.execute(
+            "SELECT COUNT(*) FROM cards WHERE game_card = 1"
+        ).fetchone()[0]
+        printings = connection.execute("SELECT COUNT(*) FROM printings").fetchone()[0]
+    finally:
+        connection.close()
+    print(
+        f"Database ready: {cards:,} cards, {printings:,} printings, {format_mb(path.stat().st_size)}."
+    )
+    print(f"Data from {short_time(meta.get('default_cards_updated_at'))}.")
+    if changes_from is None:
+        return
+    kinds = {}
+    for change in changes:
+        kinds.setdefault(change[0], []).append(change)
+    print(f"Changes since {short_time(changes_from)}:")
+    if not changes:
+        print("  none")
+        return
+    new_cards = kinds.get("new", [])
+    if new_cards:
+        sets = {}
+        for change in new_cards:
+            code = json.loads(change[3]).get("set") or "?"
+            sets[code] = sets.get(code, 0) + 1
+        print(f"  New cards: {len(new_cards)} ({count_text(sets)})")
+    legality = kinds.get("legality", [])
+    if legality:
+        formats = {}
+        for change in legality:
+            for fmt in json.loads(change[3])["formats"]:
+                formats[fmt] = formats.get(fmt, 0) + 1
+        print(f"  Legality changes: {len(legality)} cards ({count_text(formats)})")
+    labels = (
+        ("text", "Oracle text changes"),
+        ("game_changer", "Game Changer changes"),
+        ("removed", "Removed cards"),
+    )
+    for kind, label in labels:
+        if kinds.get(kind):
+            names = ", ".join(change[2] for change in kinds[kind][:5])
+            more = f" and {len(kinds[kind]) - 5} more" if len(kinds[kind]) > 5 else ""
+            print(f"  {label}: {len(kinds[kind])} ({names}{more})")
+    print("Run `mtg changes` for the full list.")
+
+
+def cmd_upgrade(args):
+    index = fetch_index()
+    target = db_path()
+    meta = read_meta(target)
+    newer = datasets_newer(index, meta) if meta else list(DATASETS)
+    if meta and not newer and not args.force:
+        print(
+            f"Already up to date. Data from {short_time(meta.get('default_cards_updated_at'))}."
+        )
+        return 0
+    downloads = data_dir() / "downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".new")
+    total = sum(index["datasets"][name]["size"] for name in DATASETS)
+    try:
+        print(
+            f"Downloading Scryfall bulk data (about {format_mb(total)})...",
+            file=sys.stderr,
+        )
+        files = {}
+        for name in DATASETS:
+            files[name] = downloads / f"{name}.jsonl.gz"
+            download(index["datasets"][name]["url"], files[name], name)
+        print("Building the database...", file=sys.stderr)
+        build_database(files, index, temporary)
+        old = read_snapshot(target) if target.exists() else None
+        changes = []
+        changes_from = None
+        if old is not None:
+            changes = compute_changes(old, read_snapshot(temporary))
+            changes_from = meta.get("default_cards_updated_at")
+            store_changes(
+                temporary,
+                changes,
+                changes_from,
+                index["datasets"]["default_cards"]["updated_at"],
+            )
+        os.replace(temporary, target)
+    except (EOFError, OSError, ValueError, sqlite3.Error) as error:
+        raise MtgError(
+            f"the upgrade failed and the old data is unchanged: {error}"
+        ) from None
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+        shutil.rmtree(downloads, ignore_errors=True)
+    print_upgrade_summary(target, changes, changes_from)
+    return 0
+
+
+def cmd_status(args):
+    path = db_path()
+    meta = read_meta(path)
+    if not meta:
+        message = f"No local card data in {data_dir()}. Run `mtg upgrade`."
+        if args.json:
+            print_json({"has_data": False, "path": str(path)})
+        else:
+            print(message)
+        return 0
+    connection = open_db()
+    counts = {
+        "cards": connection.execute(
+            "SELECT COUNT(*) FROM cards WHERE game_card = 1"
+        ).fetchone()[0],
+        "paper_cards": connection.execute(
+            "SELECT COUNT(*) FROM cards WHERE game_card = 1 AND paper = 1"
+        ).fetchone()[0],
+        "printings": connection.execute("SELECT COUNT(*) FROM printings").fetchone()[0],
+        "sets": connection.execute("SELECT COUNT(*) FROM sets").fetchone()[0],
+        "rulings": connection.execute("SELECT COUNT(*) FROM rulings").fetchone()[0],
+        "tags": connection.execute("SELECT COUNT(*) FROM tags").fetchone()[0],
+    }
+    index = load_index()
+    check = None
+    if index:
+        check = {
+            "checked_at": index.get("fetched_at"),
+            "upgrade_available": bool(datasets_newer(index, meta)),
+        }
+    status = {
+        "has_data": True,
+        "path": str(path),
+        "size": path.stat().st_size,
+        "built_at": meta.get("built_at"),
+        "data": {name: meta.get(f"{name}_updated_at") for name in DATASETS},
+        "counts": counts,
+        "last_check": check,
+    }
+    if args.json:
+        print_json(status)
+        return 0
+    print(f"Database: {path} ({format_mb(status['size'])})")
+    print(f"Built:    {short_time(status['built_at'])}")
+    print(f"Data:     {short_time(meta.get('default_cards_updated_at'))}")
+    print(
+        f"Contents: {counts['cards']:,} cards ({counts['paper_cards']:,} in paper), {counts['printings']:,} printings, "
+        f"{counts['sets']:,} sets, {counts['rulings']:,} rulings, {counts['tags']:,} tags"
+    )
+    if check:
+        state = "upgrade available" if check["upgrade_available"] else "up to date"
+        print(f"Checked:  {short_time(check['checked_at'])}, {state}")
+    else:
+        print("Checked:  never. Run `mtg update`.")
+    return 0
+
+
+def cmd_card(args):
+    connection = open_db()
+    payloads = []
+    status = 0
+    index = None
+    for raw in args.names:
+        found = resolve_name(connection, raw)
+        if found is None:
+            index = index or name_index(connection)
+            print("mtg: " + missing_card_message(raw, index), file=sys.stderr)
+            status = 1
+            continue
+        payloads.append(
+            card_payload(
+                connection, found["oracle_id"], rulings=args.rulings, prints=args.prints
+            )
+        )
+    if args.json:
+        print_json(payloads)
+    elif args.md and payloads:
+        print("\n".join(card_markdown(payload) for payload in payloads))
+    elif payloads:
+        print("\n\n".join(card_text(payload) for payload in payloads))
+    return status
+
+
+def mv_clause(expression):
+    match = MV_PATTERN.match(expression)
+    if not match:
+        raise MtgError(f"bad --mv value {expression!r}. Use for example 3, <=2 or >=5.")
+    comparison = match.group(1) or "="
+    if comparison == "==":
+        comparison = "="
+    return f"c.cmc {comparison} ?", float(match.group(2))
+
+
+def color_clause(spec, column, option):
+    letters = spec.strip().upper()
+    if letters in ("C", "COLORLESS"):
+        letters = ""
+    elif not re.fullmatch(r"[WUBRG]+", letters):
+        raise MtgError(
+            f"bad {option} value {spec!r}. Use color letters such as rw, or c for colorless."
+        )
+    excluded = [color for color in COLOR_ORDER if color not in letters]
+    if not excluded:
+        return "1"
+    return " AND ".join(f"instr(c.{column}, '{color}') = 0" for color in excluded)
+
+
+def known_formats(connection):
+    row = connection.execute(
+        "SELECT legalities FROM cards WHERE game_card = 1 LIMIT 1"
+    ).fetchone()
+    return sorted(json.loads(row[0] or "{}")) if row else []
+
+
+def check_format(connection, value):
+    fmt = re.sub(r"[^a-z0-9]", "", value.lower())
+    fmt = FORMAT_ALIASES.get(fmt, fmt)
+    formats = known_formats(connection)
+    if fmt in formats:
+        return fmt
+    close = difflib.get_close_matches(fmt, formats, n=3, cutoff=0.5)
+    hint = f" Did you mean {' or '.join(close)}?" if close else ""
+    raise MtgError(f"unknown format {value!r}.{hint} Formats: {', '.join(formats)}.")
+
+
+def check_tag(connection, slug):
+    if connection.execute("SELECT 1 FROM tags WHERE slug = ?", (slug,)).fetchone():
+        return
+    slugs = [row[0] for row in connection.execute("SELECT slug FROM tags")]
+    close = difflib.get_close_matches(slug, slugs, n=5, cutoff=0.6)
+    hint = f" Close tags: {', '.join(close)}." if close else ""
+    raise MtgError(f"unknown tag {slug!r}.{hint}")
+
+
+def search_filters(connection, args):
+    where = []
+    params = []
+    if not args.all_layouts:
+        where.append("c.game_card = 1")
+    # A format check already rules digital-only cards in or out.
+    if not args.digital and not args.legal:
+        where.append("c.paper = 1")
+    for text in args.name or []:
+        where.append(
+            "c.oracle_id IN (SELECT oracle_id FROM names WHERE key LIKE ? ESCAPE '\\')"
+        )
+        params.append(like_pattern(name_key(text)))
+    for text in args.text or []:
+        where.append("c.oracle_text LIKE ? ESCAPE '\\'")
+        params.append(like_pattern(text))
+    for pattern in args.regex or []:
+        try:
+            compiled_pattern(pattern)
+        except re.error as error:
+            raise MtgError(f"bad --regex {pattern!r}: {error}") from None
+        where.append("regexp(?, c.oracle_text)")
+        params.append(pattern)
+    if args.fts:
+        where.append("c.rowid IN (SELECT rowid FROM cards_fts WHERE cards_fts MATCH ?)")
+        params.append(args.fts)
+    for value in args.type or []:
+        options = [option.strip() for option in value.split(",") if option.strip()]
+        if not options:
+            raise MtgError(f"bad --type value {value!r}")
+        where.append(
+            "(" + " OR ".join("c.type_line LIKE ? ESCAPE '\\'" for _ in options) + ")"
+        )
+        params.extend(like_pattern(option) for option in options)
+    if args.ci:
+        where.append(color_clause(args.ci, "color_identity", "--ci"))
+    if args.colors:
+        where.append(color_clause(args.colors, "colors", "--colors"))
+    for expression in args.mv or []:
+        clause, value = mv_clause(expression)
+        where.append(clause)
+        params.append(value)
+    if args.legal:
+        fmt = check_format(connection, args.legal)
+        where.append("json_extract(c.legalities, ?) IN ('legal', 'restricted')")
+        params.append(f"$.{fmt}")
+    if args.since:
+        where.append("c.first_released > ?")
+        params.append(args.since)
+    if args.set:
+        codes = [
+            code.strip().lower()
+            for value in args.set
+            for code in value.split(",")
+            if code.strip()
+        ]
+        if not codes:
+            raise MtgError("bad --set value")
+        where.append(
+            f"c.oracle_id IN (SELECT oracle_id FROM printings WHERE set_code IN ({placeholders(len(codes))}))"
+        )
+        params.extend(codes)
+    if args.gc:
+        where.append("c.game_changer = 1")
+    for slug in args.tag or []:
+        check_tag(connection, slug)
+        where.append("c.oracle_id IN (SELECT oracle_id FROM card_tags WHERE slug = ?)")
+        params.append(slug)
+    return " AND ".join(where) or "1", params
+
+
+def search_line(row):
+    head = " ".join(part for part in (row["name"], row["mana_cost"]) if part)
+    parts = [head, row["type_line"]]
+    if row["first_released"]:
+        parts.append(f"{row['first_released']} {row['first_set']}")
+    if row["game_changer"]:
+        parts.append("Game Changer")
+    if row["edhrec_rank"]:
+        parts.append(f"EDHREC #{row['edhrec_rank']}")
+    price = price_text(row["eur"], row["usd"])
+    if price:
+        parts.append(price)
+    return " | ".join(parts)
+
+
+def cmd_search(args):
+    connection = open_db()
+    where, params = search_filters(connection, args)
+    order = SORT_ORDERS[args.sort].format(direction="DESC" if args.reverse else "ASC")
+    try:
+        total = connection.execute(
+            f"SELECT COUNT(*) FROM cards c WHERE {where}", params
+        ).fetchone()[0]
+        if args.count:
+            print(total)
+            return 0
+        query = f"SELECT c.* FROM cards c WHERE {where} ORDER BY {order}"
+        if args.limit:
+            query += f" LIMIT {int(args.limit)}"
+        rows = connection.execute(query, params).fetchall()
+    except sqlite3.OperationalError as error:
+        raise MtgError(f"search failed: {error}") from None
+    if args.json:
+        print_json([card_payload(connection, row["oracle_id"]) for row in rows])
+    elif args.md:
+        print(
+            "\n".join(
+                card_markdown(card_payload(connection, row["oracle_id"]))
+                for row in rows
+            )
+        )
+    elif args.oracle:
+        print(
+            "\n\n".join(
+                card_text(card_payload(connection, row["oracle_id"])) for row in rows
+            )
+        )
+    else:
+        for row in rows:
+            print(search_line(row))
+    if len(rows) < total and not args.json:
+        sys.stdout.flush()
+        print(f"{len(rows)} of {total} cards. Use --limit 0 for all.", file=sys.stderr)
+    return 0
+
+
+def cmd_sets(args):
+    connection = open_db()
+    where = []
+    params = []
+    if args.since:
+        where.append("released_at > ?")
+        params.append(args.since)
+    types = [value.strip() for value in (args.type or "").split(",") if value.strip()]
+    if types:
+        where.append(f"set_type IN ({placeholders(len(types))})")
+        params.extend(types)
+    if not args.digital:
+        where.append("digital = 0")
+    query = "SELECT code, name, set_type, released_at, card_count, digital, parent_set_code FROM sets"
+    if where:
+        query += " WHERE " + " AND ".join(where)
+    rows = connection.execute(query + " ORDER BY released_at, code", params).fetchall()
+    if args.json:
+        print_json([dict(row) for row in rows])
+        return 0
+    for row in rows:
+        print(
+            f"{row['released_at']}  {row['code']:<6} {row['set_type']:<16} {row['card_count']:>4}  {row['name']}"
+        )
+    return 0
+
+
+def cmd_changes(args):
+    connection = open_db()
+    meta = dict(connection.execute("SELECT key, value FROM meta").fetchall())
+    rows = connection.execute(
+        "SELECT kind, oracle_id, name, detail FROM changes ORDER BY kind, name"
+    ).fetchall()
+    changes = [
+        {
+            "kind": row["kind"],
+            "oracle_id": row["oracle_id"],
+            "name": row["name"],
+            "detail": json.loads(row["detail"]),
+        }
+        for row in rows
+    ]
+    if args.json:
+        print_json(
+            {
+                "from": meta.get("changes_from") or None,
+                "to": meta.get("changes_to") or None,
+                "changes": changes,
+            }
+        )
+        return 0
+    if not meta.get("changes_from"):
+        print("No change list yet. The first upgrade has nothing to compare with.")
+        return 0
+    print(
+        f"Changes from {short_time(meta['changes_from'])} to {short_time(meta['changes_to'])}"
+    )
+    if not changes:
+        print("No changes.")
+        return 0
+    set_names = dict(connection.execute("SELECT code, name FROM sets").fetchall())
+    new_by_set = {}
+    for change in changes:
+        if change["kind"] == "new":
+            code = change["detail"].get("set") or "?"
+            new_by_set.setdefault(code, []).append(change["name"])
+    if new_by_set:
+        print(f"New cards ({sum(len(names) for names in new_by_set.values())}):")
+        for code in sorted(new_by_set):
+            names = new_by_set[code]
+            print(
+                f"  {code} {set_names.get(code, '')} ({len(names)}): "
+                + ", ".join(sorted(names))
+            )
+    for change in changes:
+        detail = change["detail"]
+        if change["kind"] == "text":
+            print(f"Oracle text changed: {change['name']}")
+            if args.full:
+                print(
+                    "  before: "
+                    + (detail["before"]["oracle_text"] or "").replace("\n", " / ")
+                )
+                print(
+                    "  after:  "
+                    + (detail["after"]["oracle_text"] or "").replace("\n", " / ")
+                )
+        elif change["kind"] == "game_changer":
+            state = "added to" if detail["after"] else "removed from"
+            print(f"Game Changers: {change['name']} {state} the list")
+        elif change["kind"] == "removed":
+            print(f"Removed: {change['name']}")
+    print_legality_changes(changes, args.full)
+    return 0
+
+
+def format_name(fmt):
+    return FORMAT_NAMES.get(fmt, fmt)
+
+
+def plural(count, word):
+    return f"{count} {word}" + ("" if count == 1 else "s")
+
+
+def state_text(state):
+    return (state or "missing").replace("_", " ")
+
+
+def print_legality_changes(changes, full):
+    # Bans, unbans and restrictions one by one; rotations and reprints as counts.
+    grouped = {}
+    for change in changes:
+        if change["kind"] != "legality":
+            continue
+        for fmt, (before, after) in change["detail"]["formats"].items():
+            if {before, after} & {"banned", "restricted"}:
+                print(
+                    f"{format_name(fmt)}: {change['name']} "
+                    f"{state_text(before)} -> {state_text(after)}"
+                )
+            else:
+                grouped.setdefault((fmt, after), []).append(change["name"])
+    for (fmt, after), names in sorted(grouped.items()):
+        line = f"{format_name(fmt)}: {plural(len(names), 'card')} became {state_text(after)}"
+        if full:
+            line += ": " + ", ".join(sorted(names))
+        print(line)
+
+
+def cmd_sql(args):
+    connection = open_db()
+    try:
+        cursor = connection.execute(args.query)
+        columns = [column[0] for column in cursor.description or []]
+        rows = cursor.fetchall()
+    except sqlite3.Error as error:
+        raise MtgError(f"SQL error: {error}") from None
+    if args.json:
+        print_json([dict(zip(columns, row)) for row in rows])
+        return 0
+    if columns:
+        print("\t".join(columns))
+    for row in rows:
+        print("\t".join("" if value is None else str(value) for value in row))
+    return 0
+
+
+def parse_decklist(text):
+    entries = []
+    section = "main"
+    explicit = False
+    block = 0
+    for number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            if entries and entries[-1]["block"] == block:
+                block += 1
+            continue
+        header = SECTION_PATTERN.match(line)
+        if header:
+            section = SECTION_NAMES[header.group(1).lower()]
+            explicit = True
+            continue
+        if line.startswith(("#", "//")):
+            continue
+        entry_section = section
+        entry_explicit = explicit
+        if line.upper().startswith("SB:"):
+            entry_section = "side"
+            entry_explicit = True
+            line = line[3:].strip()
+        commander = "*CMDR*" in line.upper()
+        for category in CATEGORY_PATTERN.findall(line):
+            lowered = category.lower()
+            if "commander" in lowered:
+                commander = True
+            elif "maybeboard" in lowered or "considering" in lowered:
+                entry_section = "maybe"
+                entry_explicit = True
+            elif "sideboard" in lowered:
+                entry_section = "side"
+                entry_explicit = True
+        line = CATEGORY_PATTERN.sub(" ", line)
+        line = MARKER_PATTERN.sub(" ", line)
+        line = COLOR_TAG_PATTERN.sub(" ", line)
+        line = HASHTAG_PATTERN.sub(" ", line).strip()
+        line = SET_PATTERN.sub("", line).strip()
+        match = QUANTITY_PATTERN.match(line)
+        quantity, name = (
+            (int(match.group(1)), match.group(2).strip()) if match else (1, line)
+        )
+        if commander:
+            entry_section = "commander"
+            entry_explicit = True
+        if name:
+            entries.append(
+                {
+                    "line": number,
+                    "quantity": quantity,
+                    "name": name,
+                    "section": entry_section,
+                    "block": block,
+                    "explicit": entry_explicit,
+                }
+            )
+    return entries
+
+
+def mark_mtgo_sideboard(entries):
+    # MTGO lists have no headers. The block after the last blank line is the sideboard.
+    if any(entry["explicit"] for entry in entries):
+        return
+    last = entries[-1]["block"]
+    if last == 0:
+        return
+    for entry in entries:
+        if entry["block"] == last:
+            entry["section"] = "side"
+
+
+def format_rules(fmt):
+    if fmt in COMMANDER_FORMATS:
+        return {"kind": "commander", "size": COMMANDER_FORMATS[fmt], "copies": 1}
+    if fmt in SINGLETON_FORMATS:
+        return {"kind": "singleton", "size": SINGLETON_FORMATS[fmt], "copies": 1}
+    if fmt in CONSTRUCTED_FORMATS:
+        return {"kind": "constructed", "size": 60, "copies": 4, "sideboard": 15}
+    return {"kind": "other" if fmt else "none"}
+
+
+def primary_group(type_line):
+    front = (type_line or "").split(" // ")[0].split(" \u2014 ")[0]
+    for group in TYPE_GROUPS:
+        if group in front:
+            return group
+    return "Other"
+
+
+def copy_limit(card, default):
+    if "Basic" in (card["type_line"] or "").split(" // ")[0]:
+        return None
+    text = card["oracle_text"] or ""
+    if ANY_NUMBER_PATTERN.search(text):
+        return None
+    match = UP_TO_PATTERN.search(text)
+    if match:
+        return NUMBER_WORDS.get(match.group(1).lower(), default)
+    return default
+
+
+def can_be_commander(card, fmt, uncommon_ids):
+    front = (card["type_line"] or "").split(" // ")[0]
+    if fmt == "oathbreaker":
+        # The oathbreaker and its signature spell both sit in the command zone.
+        return any(kind in front for kind in ("Planeswalker", "Instant", "Sorcery"))
+    if fmt == "paupercommander":
+        return "Creature" in front and card["oracle_id"] in uncommon_ids
+    if "can be your commander" in (card["oracle_text"] or ""):
+        return True
+    if "Legendary" not in front:
+        return False
+    if "Creature" in front or "Background" in front:
+        return True
+    return fmt in ("brawl", "standardbrawl") and "Planeswalker" in front
+
+
+def has_pairing(card):
+    text = card["oracle_text"] or ""
+    return any(word in text for word in PAIRING_TEXT) or "Background" in (
+        card["type_line"] or ""
+    )
+
+
+def resolve_entries(connection, entries):
+    problems = []
+    index = None
+    for entry in entries:
+        found = resolve_name(connection, entry["name"])
+        if found is None:
+            index = index or name_index(connection)
+            problems.append(
+                f"line {entry['line']}: " + missing_card_message(entry["name"], index)
+            )
+            continue
+        entry["oracle_id"] = found["oracle_id"]
+        entry["card_name"] = found["name"]
+    return problems
+
+
+def apply_commander_flags(connection, entries, names):
+    problems = []
+    for raw in names or []:
+        found = resolve_name(connection, raw)
+        if found is None:
+            problems.append(
+                "--commander: " + missing_card_message(raw, name_index(connection))
+            )
+            continue
+        match = None
+        for entry in entries:
+            if (
+                entry.get("oracle_id") == found["oracle_id"]
+                and entry["section"] == "main"
+            ):
+                match = entry
+                break
+        if match is not None and match["quantity"] > 1:
+            match["quantity"] -= 1
+            match = None
+        if match is not None:
+            match["section"] = "commander"
+        elif not any(
+            e.get("oracle_id") == found["oracle_id"] and e["section"] == "commander"
+            for e in entries
+        ):
+            entries.append(
+                {
+                    "line": 0,
+                    "quantity": 1,
+                    "name": raw,
+                    "section": "commander",
+                    "block": 0,
+                    "explicit": True,
+                    "oracle_id": found["oracle_id"],
+                    "card_name": found["name"],
+                }
+            )
+    return problems
+
+
+def tagged_cards(connection, slug, oracle_ids):
+    if not oracle_ids:
+        return set()
+    rows = connection.execute(
+        f"SELECT oracle_id FROM card_tags WHERE slug = ? AND oracle_id IN ({placeholders(len(oracle_ids))})",
+        [slug, *oracle_ids],
+    )
+    return {row[0] for row in rows}
+
+
+def tutor_cards(connection, oracle_ids):
+    if not oracle_ids:
+        return set()
+    rows = connection.execute(
+        f"SELECT oracle_id FROM ({TUTOR_SQL}) WHERE oracle_id IN ({placeholders(len(oracle_ids))})",
+        list(oracle_ids),
+    )
+    return {row[0] for row in rows}
+
+
+def uncommon_cards(connection, oracle_ids):
+    if not oracle_ids:
+        return set()
+    rows = connection.execute(
+        "SELECT DISTINCT oracle_id FROM printings WHERE rarity = 'uncommon' "
+        f"AND oracle_id IN ({placeholders(len(oracle_ids))})",
+        list(oracle_ids),
+    )
+    return {row[0] for row in rows}
+
+
+def card_rows(connection, oracle_ids):
+    if not oracle_ids:
+        return {}
+    rows = connection.execute(
+        f"SELECT * FROM cards WHERE oracle_id IN ({placeholders(len(oracle_ids))})",
+        list(oracle_ids),
+    ).fetchall()
+    faces = {}
+    for face in connection.execute(
+        f"SELECT oracle_id, idx, type_line FROM faces WHERE oracle_id IN ({placeholders(len(oracle_ids))})",
+        list(oracle_ids),
+    ):
+        faces.setdefault(face["oracle_id"], {})[face["idx"]] = face["type_line"]
+    result = {}
+    for row in rows:
+        record = dict(row)
+        record["face_types"] = faces.get(row["oracle_id"], {})
+        result[row["oracle_id"]] = record
+    return result
+
+
+def find_combos(commanders, mainboard):
+    payload = {
+        "commanders": [{"card": name, "quantity": 1} for name in commanders],
+        "main": [{"card": name, "quantity": quantity} for name, quantity in mainboard],
+    }
+    result = http_post_json(spellbook_api() + "/find-my-combos", payload)
+    data = result.get("results", result)
+    return {
+        "included": [combo_summary(variant) for variant in data.get("included", [])],
+        "one_card_away": [
+            combo_summary(variant) for variant in data.get("almostIncluded", [])
+        ],
+    }
+
+
+def combo_summary(variant):
+    return {
+        "id": variant.get("id"),
+        "cards": [
+            use["card"]["name"] for use in variant.get("uses", []) if use.get("card")
+        ],
+        "produces": [
+            item["feature"]["name"]
+            for item in variant.get("produces", [])
+            if item.get("feature")
+        ],
+        "url": f"https://commanderspellbook.com/combo/{variant.get('id')}/",
+    }
+
+
+def sort_by_name(cards, oracle_id):
+    return cards[oracle_id]["name"]
+
+
+def check_size(rules, fmt, total, side_total):
+    problems = []
+    if rules["kind"] in ("commander", "singleton") and total != rules["size"]:
+        included = ", commander included" if rules["kind"] == "commander" else ""
+        problems.append(
+            f"the deck has {total} cards. {format_name(fmt)} needs exactly "
+            f"{rules['size']}{included}."
+        )
+    if rules["kind"] == "constructed":
+        if total < rules["size"]:
+            problems.append(
+                f"the main deck has {total} cards. {format_name(fmt)} needs at least "
+                f"{rules['size']}."
+            )
+        if side_total > rules["sideboard"]:
+            problems.append(
+                f"the sideboard has {side_total} cards. The maximum is {rules['sideboard']}."
+            )
+    return problems
+
+
+def check_copies(rules, fmt, cards, entries, states):
+    problems = []
+    copies = {}
+    for entry in entries:
+        copies[entry["oracle_id"]] = (
+            copies.get(entry["oracle_id"], 0) + entry["quantity"]
+        )
+    for oracle_id in sorted(copies, key=functools.partial(sort_by_name, cards)):
+        limit = copy_limit(cards[oracle_id], rules["copies"])
+        reason = ""
+        if rules["kind"] == "constructed" and states.get(oracle_id) == "restricted":
+            limit = 1
+            reason = f" (restricted in {format_name(fmt)})"
+        if limit is not None and copies[oracle_id] > limit:
+            problems.append(
+                f"{cards[oracle_id]['name']}: {copies[oracle_id]} copies, the limit is "
+                f"{limit}{reason}."
+            )
+    return problems
+
+
+def check_commanders(connection, fmt, cards, commanders, oracle_ids, states):
+    problems = []
+    warnings = []
+    if not commanders:
+        warnings.append(
+            "no commander found. Add a Commander section or use --commander. "
+            "Colors not checked."
+        )
+        return "", problems, warnings
+    commander_ids = [entry["oracle_id"] for entry in commanders]
+    identity = color_string(
+        list("".join(cards[oracle_id]["color_identity"] for oracle_id in commander_ids))
+    )
+    uncommon = (
+        uncommon_cards(connection, commander_ids) if fmt == "paupercommander" else set()
+    )
+    for oracle_id in commander_ids:
+        card = cards[oracle_id]
+        if not can_be_commander(card, fmt, uncommon):
+            problems.append(
+                f"{card['name']} can't be a commander in {format_name(fmt)}."
+            )
+        elif states.get(oracle_id) == "restricted":
+            problems.append(
+                f"{card['name']} can't be a commander in {format_name(fmt)} (restricted)."
+            )
+    if len(commanders) > 2:
+        problems.append(f"{len(commanders)} commanders. The maximum is 2.")
+    elif (
+        len(commanders) == 2
+        and fmt != "oathbreaker"
+        and not all(has_pairing(cards[oracle_id]) for oracle_id in commander_ids)
+    ):
+        warnings.append(
+            "two commanders, but not both have a partner or background ability."
+        )
+    for oracle_id in sorted(oracle_ids, key=functools.partial(sort_by_name, cards)):
+        card_identity = cards[oracle_id]["color_identity"] or ""
+        if any(color not in identity for color in card_identity):
+            problems.append(
+                f"{cards[oracle_id]['name']} has identity {card_identity}, outside the "
+                f"commander's {identity or 'C'}."
+            )
+    return identity, problems, warnings
+
+
+def check_legality(fmt, cards, oracle_ids, states):
+    problems = []
+    for oracle_id in sorted(oracle_ids, key=functools.partial(sort_by_name, cards)):
+        card = cards[oracle_id]
+        state = states.get(oracle_id)
+        if state in ("legal", "restricted"):
+            continue
+        if state == "banned":
+            problems.append(f"{card['name']} is banned in {format_name(fmt)}.")
+        elif card["first_released"] and card["first_released"] > today():
+            problems.append(
+                f"{card['name']} is not released yet ({card['first_released']})."
+            )
+        else:
+            problems.append(f"{card['name']} is not legal in {format_name(fmt)}.")
+    return problems
+
+
+def check_deck(connection, entries, commander_names, fmt):
+    problems = resolve_entries(connection, entries)
+    problems += apply_commander_flags(connection, entries, commander_names)
+    rules = format_rules(fmt)
+    warnings = []
+    if rules["kind"] == "none":
+        warnings.append(
+            "no format given, so legality, deck size and copies are not checked. "
+            "Use --format, for example --format modern."
+        )
+    elif rules["kind"] == "other":
+        warnings.append(
+            f"mtg has no deck size rules for {format_name(fmt)}. Only legality is checked."
+        )
+    resolved = [entry for entry in entries if entry.get("oracle_id")]
+    if rules["kind"] == "commander":
+        counted = [e for e in resolved if e["section"] in ("commander", "main")]
+        sideboard = []
+        outside = [e for e in resolved if e["section"] == "companion"]
+        ignored_sections = ("side", "maybe", "tokens")
+    else:
+        for entry in resolved:
+            if entry["section"] == "commander":
+                entry["section"] = "main"
+        counted = [e for e in resolved if e["section"] == "main"]
+        sideboard = [e for e in resolved if e["section"] in ("side", "companion")]
+        outside = []
+        ignored_sections = ("maybe", "tokens")
+    oracle_ids = {entry["oracle_id"] for entry in counted + sideboard + outside}
+    cards = card_rows(connection, oracle_ids)
+    states = {}
+    if fmt:
+        for oracle_id in oracle_ids:
+            states[oracle_id] = json.loads(cards[oracle_id]["legalities"] or "{}").get(
+                fmt
+            )
+    commanders = [entry for entry in counted if entry["section"] == "commander"]
+    total = sum(entry["quantity"] for entry in counted)
+    side_total = sum(entry["quantity"] for entry in sideboard)
+
+    problems += check_size(rules, fmt, total, side_total)
+    if "copies" in rules:
+        problems += check_copies(rules, fmt, cards, counted + sideboard, states)
+    identity = ""
+    if rules["kind"] == "commander":
+        identity, more_problems, more_warnings = check_commanders(
+            connection, fmt, cards, commanders, oracle_ids, states
+        )
+        problems += more_problems
+        warnings += more_warnings
+    if fmt:
+        problems += check_legality(fmt, cards, oracle_ids, states)
+
+    ignored = {}
+    for entry in entries:
+        if entry["section"] in ignored_sections:
+            ignored[entry["section"]] = (
+                ignored.get(entry["section"], 0) + entry["quantity"]
+            )
+    return {
+        "format": fmt,
+        "kind": rules["kind"],
+        "counted": counted,
+        "sideboard": sideboard,
+        "outside": outside,
+        "cards": cards,
+        "states": states,
+        "commanders": commanders,
+        "identity": identity,
+        "total": total,
+        "side_total": side_total,
+        "problems": problems,
+        "warnings": warnings,
+        "ignored": ignored,
+    }
+
+
+def deck_statistics(result):
+    groups = {}
+    land_faces = 0
+    curve = {}
+    mv_total = 0.0
+    nonland = 0
+    for entry in result["counted"]:
+        card = result["cards"][entry["oracle_id"]]
+        group = primary_group(card["type_line"])
+        groups[group] = groups.get(group, 0) + entry["quantity"]
+        back = card["face_types"].get(1, "")
+        if group != "Land" and "Land" in back.split(" \u2014 ")[0]:
+            land_faces += entry["quantity"]
+        if group != "Land":
+            nonland += entry["quantity"]
+            mv_total += (card["cmc"] or 0) * entry["quantity"]
+            bucket = min(int(card["cmc"] or 0), 7)
+            curve[bucket] = curve.get(bucket, 0) + entry["quantity"]
+    return {
+        "groups": {
+            group: groups[group]
+            for group in TYPE_GROUPS + ("Other",)
+            if group in groups
+        },
+        "land_faces": land_faces,
+        "average_mv": round(mv_total / nonland, 2) if nonland else 0,
+        "curve": {
+            ("7+" if bucket == 7 else str(bucket)): curve.get(bucket, 0)
+            for bucket in range(8)
+        },
+    }
+
+
+def deck_signals(connection, result):
+    oracle_ids = sorted({entry["oracle_id"] for entry in result["counted"]})
+    cards = result["cards"]
+    name_of = functools.partial(sort_by_name, cards)
+    return {
+        "game_changers": sorted(
+            name_of(oracle_id)
+            for oracle_id in oracle_ids
+            if cards[oracle_id]["game_changer"]
+        ),
+        "tutors": sorted(
+            name_of(oracle_id) for oracle_id in tutor_cards(connection, oracle_ids)
+        ),
+        "extra_turns": sorted(
+            name_of(oracle_id)
+            for oracle_id in tagged_cards(connection, "extra-turn", oracle_ids)
+        ),
+        "mass_land_denial": sorted(
+            name_of(oracle_id)
+            for oracle_id in tagged_cards(connection, "mass-land-denial", oracle_ids)
+        ),
+    }
+
+
+def bracket_note(signals):
+    count = len(signals["game_changers"])
+    if signals["mass_land_denial"]:
+        return "mass land denial puts the deck in bracket 4 or higher"
+    if count >= 4:
+        return "4 or more Game Changers put the deck in bracket 4 or higher"
+    if count:
+        return (
+            f"{plural(count, 'Game Changer')}: bracket 3 or higher (bracket 3 allows 3)"
+        )
+    return "no Game Changers"
+
+
+def name_list(names):
+    return f"{len(names)} ({', '.join(names)})" if names else "none"
+
+
+def print_deck_report(result, statistics, signals, combos):
+    fmt = result["format"]
+    print(f"Format: {format_name(fmt) if fmt else 'not given'}")
+    if result["kind"] == "commander":
+        names = [result["cards"][e["oracle_id"]]["name"] for e in result["commanders"]]
+        if names:
+            print(f"Commander: {' + '.join(names)} ({result['identity'] or 'C'})")
+        main_count = result["total"] - sum(e["quantity"] for e in result["commanders"])
+        print(f"Cards: {result['total']} ({len(names)} commander + {main_count})")
+    elif result["kind"] == "singleton":
+        print(f"Cards: {result['total']}")
+    else:
+        print(f"Main: {result['total']}, sideboard: {result['side_total']}")
+    group_text = ", ".join(
+        f"{count} {GROUP_TITLES[group].lower()}"
+        for group, count in statistics["groups"].items()
+    )
+    if statistics["land_faces"]:
+        group_text += f" (+{statistics['land_faces']} land backs on double-faced cards)"
+    print(f"Types: {group_text}")
+    print(f"Average MV without lands: {statistics['average_mv']}")
+    print(
+        "Curve: "
+        + " | ".join(
+            f"{bucket}: {count}" for bucket, count in statistics["curve"].items()
+        )
+    )
+    if signals is not None:
+        print(f"Game Changers: {name_list(signals['game_changers'])}")
+        print(f"Bracket: {bracket_note(signals)}")
+        print(f"Tutors: {name_list(signals['tutors'])}")
+        print(f"Extra turns: {name_list(signals['extra_turns'])}")
+        print(f"Mass land denial: {name_list(signals['mass_land_denial'])}")
+    if combos is not None:
+        if "error" in combos:
+            print(f"Combos: Commander Spellbook check failed ({combos['error']})")
+        else:
+            print(
+                f"Combos: {len(combos['included'])} in the deck, "
+                f"{len(combos['one_card_away'])} one card away (Commander Spellbook)"
+            )
+            for combo in combos["included"]:
+                print(
+                    f"  - {' + '.join(combo['cards'])}: "
+                    f"{', '.join(combo['produces'][:3])} {combo['url']}"
+                )
+    if result["ignored"]:
+        parts = ", ".join(
+            f"{count} in {section}"
+            for section, count in sorted(result["ignored"].items())
+        )
+        print(f"Not counted: {parts}")
+    for warning in result["warnings"]:
+        print(f"Warning: {warning}")
+    if result["problems"]:
+        print(f"Problems ({len(result['problems'])}):")
+        for problem in result["problems"]:
+            print(f"  - {problem}")
+    else:
+        print("Problems: none")
+
+
+def deck_oracle(connection, result, markdown):
+    grouped = {}
+    for entry in result["counted"] + result["sideboard"]:
+        card = result["cards"][entry["oracle_id"]]
+        if entry["section"] == "commander":
+            group = "Commander"
+        elif entry in result["sideboard"]:
+            group = "Sideboard"
+        else:
+            group = primary_group(card["type_line"])
+        grouped.setdefault(group, []).append((card["cmc"] or 0, card["name"], entry))
+    blocks = []
+    for group in DISPLAY_GROUPS:
+        items = sorted(grouped.get(group, []), key=operator.itemgetter(0, 1))
+        if not items:
+            continue
+        count = sum(item[2]["quantity"] for item in items)
+        blocks.append(
+            f"## {GROUP_TITLES[group]} ({count})\n"
+            if markdown
+            else f"== {GROUP_TITLES[group]} ({count}) =="
+        )
+        for _, _, entry in items:
+            payload = card_payload(connection, entry["oracle_id"])
+            if markdown:
+                blocks.append(card_markdown(payload, entry["quantity"]))
+            else:
+                blocks.append(card_text(payload, entry["quantity"]) + "\n")
+    return "\n".join(blocks)
+
+
+def deck_json(result, statistics, signals, combos):
+    cards = []
+    for entry in result["counted"] + result["sideboard"] + result["outside"]:
+        card = result["cards"][entry["oracle_id"]]
+        cards.append(
+            {
+                "name": card["name"],
+                "quantity": entry["quantity"],
+                "section": entry["section"],
+                "type_line": card["type_line"],
+                "mv": card["cmc"],
+                "color_identity": card["color_identity"],
+                "legality": result["states"].get(entry["oracle_id"]),
+                "game_changer": bool(card["game_changer"]),
+                "oracle_id": entry["oracle_id"],
+            }
+        )
+    return {
+        "format": result["format"],
+        "commanders": [
+            result["cards"][entry["oracle_id"]]["name"]
+            for entry in result["commanders"]
+        ],
+        "identity": result["identity"],
+        "main": result["total"],
+        "sideboard": result["side_total"],
+        "statistics": statistics,
+        "signals": signals,
+        "bracket_note": bracket_note(signals) if signals is not None else None,
+        "combos": combos,
+        "not_counted": result["ignored"],
+        "warnings": result["warnings"],
+        "problems": result["problems"],
+        "cards": cards,
+    }
+
+
+def cmd_deck(args):
+    try:
+        text = (
+            sys.stdin.read()
+            if args.file == "-"
+            else Path(args.file).expanduser().read_text(encoding="utf-8")
+        )
+    except OSError as error:
+        raise MtgError(f"can't read {args.file}: {error.strerror}") from None
+    connection = open_db()
+    entries = parse_decklist(text)
+    if not entries:
+        raise MtgError("the decklist has no cards.")
+    fmt = check_format(connection, args.format) if args.format else None
+    if fmt is None and (
+        args.commander or any(entry["section"] == "commander" for entry in entries)
+    ):
+        fmt = "commander"
+    if format_rules(fmt)["kind"] not in ("commander", "singleton"):
+        mark_mtgo_sideboard(entries)
+    result = check_deck(connection, entries, args.commander, fmt)
+    statistics = deck_statistics(result)
+    signals = deck_signals(connection, result) if fmt == "commander" else None
+    combos = None
+    if args.combos:
+        cards = result["cards"]
+        commanders = [
+            cards[entry["oracle_id"]]["name"] for entry in result["commanders"]
+        ]
+        mainboard = [
+            (cards[entry["oracle_id"]]["name"], entry["quantity"])
+            for entry in result["counted"]
+            if entry["section"] == "main"
+        ]
+        try:
+            combos = find_combos(commanders, mainboard)
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            combos = {"error": str(error)}
+    if args.json:
+        print_json(deck_json(result, statistics, signals, combos))
+    else:
+        print_deck_report(result, statistics, signals, combos)
+        if args.oracle or args.md:
+            print()
+            print(deck_oracle(connection, result, markdown=args.md))
+    return 1 if result["problems"] else 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="mtg",
+        description="Local Magic: The Gathering card database built from Scryfall bulk data.",
+        epilog="Data directory: $MTG_HOME, default $XDG_CACHE_HOME/mtg or ~/.cache/mtg.",
+    )
+    parser.add_argument("--version", action="version", version=f"mtg {VERSION}")
+    commands = parser.add_subparsers(dest="command", required=True, metavar="command")
+
+    update = commands.add_parser(
+        "update",
+        help="check Scryfall for newer data and new cards, without downloading",
+    )
+    update.add_argument("--json", action="store_true", help="print JSON")
+    update.set_defaults(handler=cmd_update)
+
+    upgrade = commands.add_parser(
+        "upgrade", help="download the newer data and rebuild the database"
+    )
+    upgrade.add_argument(
+        "--force", action="store_true", help="rebuild even when the data is up to date"
+    )
+    upgrade.set_defaults(handler=cmd_upgrade)
+
+    status = commands.add_parser("status", help="show the local data")
+    status.add_argument("--json", action="store_true", help="print JSON")
+    status.set_defaults(handler=cmd_status)
+
+    card = commands.add_parser("card", help="print the exact Oracle text of cards")
+    card.add_argument(
+        "names",
+        nargs="+",
+        metavar="NAME",
+        help="card name, full or one face, case and accents ignored",
+    )
+    card.add_argument("--rulings", action="store_true", help="add the rulings")
+    card.add_argument(
+        "--prints", action="store_true", help="add the printings with prices"
+    )
+    card.add_argument("--json", action="store_true", help="print JSON")
+    card.add_argument("--md", action="store_true", help="print Markdown")
+    card.set_defaults(handler=cmd_card)
+
+    search = commands.add_parser(
+        "search", help="find cards with filters (all filters must match)"
+    )
+    search.add_argument("--name", action="append", help="part of the name")
+    search.add_argument(
+        "--text", action="append", help="part of the Oracle text, case ignored"
+    )
+    search.add_argument(
+        "--regex",
+        action="append",
+        help="regular expression on the Oracle text, case ignored",
+    )
+    search.add_argument(
+        "--fts",
+        help="SQLite FTS5 query on name, type and text, such as 'draw NEAR card'",
+    )
+    search.add_argument(
+        "--type",
+        action="append",
+        help="part of the type line, commas mean OR: instant,sorcery",
+    )
+    search.add_argument(
+        "--ci",
+        help="color identity within these colors, such as rw, or c for colorless",
+    )
+    search.add_argument(
+        "--colors",
+        help="card colors within these colors, such as rw, or c for colorless",
+    )
+    search.add_argument(
+        "--mv", action="append", help="mana value, such as 3, <=2 or >=5"
+    )
+    search.add_argument(
+        "--legal", help="legal in this format, such as modern, pauper or commander"
+    )
+    search.add_argument(
+        "--since", metavar="DATE", help="first printed after this date (YYYY-MM-DD)"
+    )
+    search.add_argument(
+        "--set", action="append", help="has a printing in this set code, commas mean OR"
+    )
+    search.add_argument("--gc", action="store_true", help="Game Changers only")
+    search.add_argument(
+        "--tag",
+        action="append",
+        help="Scryfall Tagger tag with its child tags, such as removal",
+    )
+    search.add_argument(
+        "--digital",
+        action="store_true",
+        help="include cards that exist only in digital games",
+    )
+    search.add_argument(
+        "--all-layouts",
+        action="store_true",
+        help="include tokens, emblems and art cards",
+    )
+    search.add_argument(
+        "--sort",
+        choices=sorted(SORT_ORDERS),
+        default="name",
+        help="default: name. edhrec puts the cards most played in Commander first",
+    )
+    search.add_argument("--reverse", action="store_true", help="reverse the sort")
+    search.add_argument(
+        "--limit", type=int, default=50, help="maximum results, 0 for all (default 50)"
+    )
+    output = search.add_mutually_exclusive_group()
+    output.add_argument(
+        "--oracle", action="store_true", help="print the full Oracle text"
+    )
+    output.add_argument("--md", action="store_true", help="print Markdown")
+    output.add_argument("--json", action="store_true", help="print JSON")
+    output.add_argument(
+        "--count", action="store_true", help="print only the number of results"
+    )
+    search.set_defaults(handler=cmd_search)
+
+    sets = commands.add_parser("sets", help="list sets")
+    sets.add_argument(
+        "--since", metavar="DATE", help="released after this date (YYYY-MM-DD)"
+    )
+    sets.add_argument("--type", help="set types, commas mean OR: expansion,commander")
+    sets.add_argument("--digital", action="store_true", help="include digital sets")
+    sets.add_argument("--json", action="store_true", help="print JSON")
+    sets.set_defaults(handler=cmd_sets)
+
+    changes = commands.add_parser("changes", help="show what the last upgrade changed")
+    changes.add_argument(
+        "--full", action="store_true", help="show the old and new Oracle text"
+    )
+    changes.add_argument("--json", action="store_true", help="print JSON")
+    changes.set_defaults(handler=cmd_changes)
+
+    sql = commands.add_parser("sql", help="run a read-only SQL query on the database")
+    sql.add_argument(
+        "query", help="for example: SELECT name FROM cards WHERE game_changer = 1"
+    )
+    sql.add_argument("--json", action="store_true", help="print JSON")
+    sql.set_defaults(handler=cmd_sql)
+
+    deck = commands.add_parser(
+        "deck",
+        help="check a decklist and print its cards",
+        description=(
+            "Reads a decklist (Moxfield, Archidekt, MTGA, MTGO or plain text). "
+            "A Commander section or --commander means Commander, unless --format says "
+            "otherwise. Exit status 1 when it finds problems."
+        ),
+    )
+    deck.add_argument("file", help="decklist file, or - for standard input")
+    deck.add_argument(
+        "--format",
+        help="format to check, such as modern, pauper, vintage, brawl or oathbreaker",
+    )
+    deck.add_argument(
+        "--commander",
+        action="append",
+        metavar="NAME",
+        help="commander, when the list has no section",
+    )
+    deck.add_argument(
+        "--combos",
+        action="store_true",
+        help="look for combos on Commander Spellbook (online)",
+    )
+    deck_output = deck.add_mutually_exclusive_group()
+    deck_output.add_argument(
+        "--oracle", action="store_true", help="also print the Oracle text of every card"
+    )
+    deck_output.add_argument(
+        "--md", action="store_true", help="also print the Oracle text as Markdown"
+    )
+    deck_output.add_argument("--json", action="store_true", help="print JSON")
+    deck.set_defaults(handler=cmd_deck)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.handler(args)
+    except MtgError as error:
+        print(f"mtg: {error}", file=sys.stderr)
+        return 2
+    except urllib.error.URLError as error:
+        print(f"mtg: network error: {getattr(error, 'reason', error)}", file=sys.stderr)
+        return 2
+    except BrokenPipeError:
+        # Output piped into `head` and closed early.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
